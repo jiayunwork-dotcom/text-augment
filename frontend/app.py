@@ -252,69 +252,157 @@ elif page == "🔧 Augmentation":
             sel_v = st.selectbox("Source Version", list(v_opts.keys()))
             source_v_id = v_opts[sel_v]
 
-            strategy = st.selectbox(
-                "Augmentation Strategy",
-                ["synonym_replacement", "random_ops", "back_translation", "context_augment", "template_generation"],
-            )
-
-            st.subheader("Strategy Parameters")
-            params = {}
+            mode = st.radio("Mode", ["Single Strategy", "Composite Pipeline"], horizontal=True)
             multiplier = st.number_input("Augmentation Multiplier", 0.1, 10.0, 1.0, 0.5)
 
-            if strategy == "synonym_replacement":
-                params["replace_ratio"] = st.slider("Replace Ratio", 0.01, 0.5, 0.1, 0.01)
-                params["language"] = st.selectbox("Language", ["en", "zh"])
+            def _get_strategy_params(strategy_name, key_prefix=""):
+                params = {}
+                if strategy_name == "synonym_replacement":
+                    params["replace_ratio"] = st.slider(f"Replace Ratio", 0.01, 0.5, 0.1, 0.01, key=f"{key_prefix}replace_ratio")
+                    params["language"] = st.selectbox(f"Language", ["en", "zh"], key=f"{key_prefix}lang")
+                elif strategy_name == "random_ops":
+                    params["n_ops"] = st.number_input(f"Number of Operations (0=auto)", 0, 20, 0, key=f"{key_prefix}n_ops")
+                    if params["n_ops"] == 0:
+                        params["n_ops"] = None
+                    params["delete_prob"] = st.slider(f"Delete Probability", 0.05, 0.5, 0.1, 0.05, key=f"{key_prefix}del_prob")
+                    params["language"] = st.selectbox(f"Language", ["en"], key=f"{key_prefix}rand_lang")
+                elif strategy_name == "back_translation":
+                    params["source_language"] = st.selectbox(f"Source Language", ["en", "zh", "de", "fr", "ja"], key=f"{key_prefix}bt_src")
+                    use_custom_pivot = st.checkbox(f"Use custom pivot language (advanced)", value=False, key=f"{key_prefix}custom_pivot")
+                    if use_custom_pivot:
+                        params["pivot_language"] = st.text_input(
+                            f"Pivot Language Code",
+                            value="fr",
+                            key=f"{key_prefix}pivot_code",
+                            help="e.g., 'fr' for French, 'es' for Spanish, 'de' for German. "
+                                 "Note: Pivot must be from a different language family than source."
+                        )
+                    else:
+                        pivot_options = {
+                            "en": ["fr", "de", "es", "zh", "ja"],
+                            "zh": ["en", "fr", "de", "ja"],
+                            "de": ["fr", "es", "zh", "ja"],
+                            "fr": ["en", "de", "zh", "ja"],
+                            "ja": ["en", "zh", "fr", "de"],
+                        }
+                        pivots = pivot_options.get(params["source_language"], ["en", "fr"])
+                        params["pivot_language"] = st.selectbox(f"Pivot Language", pivots, key=f"{key_prefix}pivot")
+                    params["num_variants"] = st.number_input(f"Number of Variants", 1, 5, 1, key=f"{key_prefix}num_variants")
+                elif strategy_name == "context_augment":
+                    params["mask_ratio"] = st.slider(f"Mask Ratio", 0.05, 0.5, 0.15, 0.05, key=f"{key_prefix}mask_ratio")
+                    params["top_k"] = st.number_input(f"Top-K Sampling", 1, 20, 5, key=f"{key_prefix}top_k")
+                    params["num_variants"] = st.number_input(f"Number of Variants", 1, 10, 1, key=f"{key_prefix}num_vars")
+                    params["model_name"] = st.selectbox(f"MLM Model", ["bert-base-uncased", "bert-base-chinese"], key=f"{key_prefix}model")
+                elif strategy_name == "template_generation":
+                    params["template"] = st.text_input(f"Template", value="{label}类的例子: {text}", key=f"{key_prefix}template")
+                    params["samples_per_seed"] = st.number_input(f"Samples Per Seed", 1, 20, 3, key=f"{key_prefix}samples_per_seed")
+                return params
 
-            elif strategy == "random_ops":
-                params["n_ops"] = st.number_input("Number of Operations (0=auto)", 0, 20, 0)
-                if params["n_ops"] == 0:
-                    params["n_ops"] = None
-                params["delete_prob"] = st.slider("Delete Probability", 0.05, 0.5, 0.1, 0.05)
-                params["language"] = st.selectbox("Language", ["en"], key="rand_lang")
+            is_composite = mode == "Composite Pipeline"
+            steps = []
 
-            elif strategy == "back_translation":
-                params["source_language"] = st.selectbox("Source Language", ["en", "zh", "de", "fr", "ja"], key="bt_src")
-                use_custom_pivot = st.checkbox("Use custom pivot language (advanced)", value=False)
-                if use_custom_pivot:
-                    params["pivot_language"] = st.text_input(
-                        "Pivot Language Code",
-                        value="fr",
-                        help="e.g., 'fr' for French, 'es' for Spanish, 'de' for German. "
-                             "Note: Pivot must be from a different language family than source."
-                    )
-                else:
-                    pivot_options = {
-                        "en": ["fr", "de", "es", "zh", "ja"],
-                        "zh": ["en", "fr", "de", "ja"],
-                        "de": ["fr", "es", "zh", "ja"],
-                        "fr": ["en", "de", "zh", "ja"],
-                        "ja": ["en", "zh", "fr", "de"],
-                    }
-                    pivots = pivot_options.get(params["source_language"], ["en", "fr"])
-                    params["pivot_language"] = st.selectbox("Pivot Language", pivots)
-                params["num_variants"] = st.number_input("Number of Variants", 1, 5, 1)
+            if is_composite:
+                st.subheader("Pipeline Steps")
+                st.info("💡 Constraints: Back-translation must be first step. "
+                        "Context augmentation cannot follow random_ops immediately.")
+                num_steps = st.number_input("Number of Steps", 1, 10, 2, 1)
+                strategy_list = ["synonym_replacement", "random_ops", "back_translation", "context_augment", "template_generation"]
 
-                st.info(f"💡 Source language '{params['source_language']}' family check will be performed. "
-                        "Same-family pairs (e.g., en-de) will be rejected.")
+                for i in range(int(num_steps)):
+                    with st.expander(f"Step {i + 1}", expanded=True):
+                        step_strategy = st.selectbox(
+                            f"Strategy (Step {i+1})",
+                            strategy_list,
+                            key=f"step_strat_{i}",
+                        )
+                        step_params = _get_strategy_params(step_strategy, key_prefix=f"step_{i}_")
+                        steps.append({"strategy": step_strategy, "strategy_params": step_params})
+            else:
+                strategy = st.selectbox(
+                    "Augmentation Strategy",
+                    ["synonym_replacement", "random_ops", "back_translation", "context_augment", "template_generation"],
+                )
+                st.subheader("Strategy Parameters")
+                params = _get_strategy_params(strategy)
 
-            elif strategy == "context_augment":
-                params["mask_ratio"] = st.slider("Mask Ratio", 0.05, 0.5, 0.15, 0.05)
-                params["top_k"] = st.number_input("Top-K Sampling", 1, 20, 5)
-                params["num_variants"] = st.number_input("Number of Variants", 1, 10, 1)
-                params["model_name"] = st.selectbox("MLM Model", ["bert-base-uncased", "bert-base-chinese"])
+            col1, col2 = st.columns(2)
+            with col1:
+                preview_clicked = st.button("🔍 Preview Effect", type="secondary")
+            with col2:
+                create_clicked = st.button("✨ Create Augmentation Task", type="primary")
 
-            elif strategy == "template_generation":
-                params["template"] = st.text_input("Template", value="{label}类的例子: {text}")
-                params["samples_per_seed"] = st.number_input("Samples Per Seed", 1, 20, 3)
+            if preview_clicked:
+                with st.spinner("Generating preview..."):
+                    if is_composite:
+                        st.info("Preview for composite pipeline shows the first step result only.")
+                        first_step = steps[0] if steps else None
+                        if first_step:
+                            preview_strategy = first_step["strategy"]
+                            preview_params = first_step["strategy_params"]
+                        else:
+                            st.warning("Please add at least one step.")
+                            st.stop()
+                    else:
+                        preview_strategy = strategy
+                        preview_params = params
 
-            if st.button("Create Augmentation Task"):
-                payload = {
-                    "dataset_id": ds_id,
+                preview_payload = {
                     "source_version_id": source_v_id,
-                    "strategy": strategy,
-                    "strategy_params": params,
-                    "augmentation_multiplier": multiplier,
+                    "strategy": preview_strategy,
+                    "strategy_params": preview_params,
                 }
+                preview_result = api_post("/augmentation/preview", data=preview_payload, timeout=15)
+                if preview_result and "error" not in preview_result:
+                    st.subheader(f"Preview Results - {preview_result.get('strategy')}")
+                    st.caption(f"Success: {preview_result.get('success_count', 0)}/{preview_result.get('total_count', 0)}, "
+                               f"Timed out: {preview_result.get('timed_out_count', 0)}")
+
+                    samples = preview_result.get("samples", [])
+                    for idx, s in enumerate(samples):
+                        with st.container():
+                            st.markdown(f"**Sample {idx + 1}**")
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                st.info("Original")
+                                st.write(s.get("original_text", ""))
+                            with c2:
+                                if s.get("timed_out"):
+                                    st.warning("⏱️ Timed out")
+                                elif s.get("error"):
+                                    st.error(f"Error: {s.get('error')}")
+                                elif s.get("augmented_text"):
+                                    st.success("Augmented")
+                                    st.write(s.get("augmented_text"))
+                                else:
+                                    st.info("No change")
+                                    st.write(s.get("original_text", ""))
+                            st.divider()
+                else:
+                    error_msg = preview_result.get("error", "Unknown error") if preview_result else "No response"
+                    st.error(f"Preview failed: {error_msg}")
+
+            if create_clicked:
+                if is_composite:
+                    step_list = [{"strategy": s["strategy"], "strategy_params": s["strategy_params"]} for s in steps]
+                    payload = {
+                        "dataset_id": ds_id,
+                        "source_version_id": source_v_id,
+                        "strategy": "composite",
+                        "strategy_params": {},
+                        "augmentation_multiplier": multiplier,
+                        "is_composite": True,
+                        "steps": step_list,
+                    }
+                else:
+                    payload = {
+                        "dataset_id": ds_id,
+                        "source_version_id": source_v_id,
+                        "strategy": strategy,
+                        "strategy_params": params,
+                        "augmentation_multiplier": multiplier,
+                        "is_composite": False,
+                        "steps": [],
+                    }
                 result = api_post("/augmentation/tasks", data=payload)
                 if "error" in result:
                     st.error(f"Failed: {result['error']}")
@@ -327,19 +415,39 @@ elif page == "🔧 Augmentation":
         tasks = api_get("/augmentation/tasks") or []
         if tasks:
             t_df = pd.DataFrame(tasks)
-            disp = ["id", "dataset_id", "strategy", "status", "total_samples", "processed_samples", "generated_samples", "estimated_remaining_seconds"]
-            avail = [c for c in disp if c in t_df.columns]
+            disp_cols = ["id", "dataset_id", "strategy", "status", "total_samples", "processed_samples", "generated_samples", "estimated_remaining_seconds"]
+            avail = [c for c in disp_cols if c in t_df.columns]
             st.dataframe(t_df[avail], use_container_width=True)
 
-            st.subheader("Task Actions")
+            st.subheader("Task Detail & Actions")
             task_opts = {f"Task {t['id']}: {t['strategy']} ({t['status']})": t["id"] for t in tasks}
             sel_task = st.selectbox("Select Task", list(task_opts.keys()))
             if sel_task:
                 tid = task_opts[sel_task]
-                action = st.selectbox("Action", ["pause", "resume", "cancel"])
-                if st.button("Execute Action"):
-                    result = api_post(f"/augmentation/tasks/{tid}/action", data={"action": action})
-                    st.json(result)
+                task_detail = api_get(f"/augmentation/tasks/{tid}")
+
+                if task_detail:
+                    if task_detail.get("is_composite") and task_detail.get("step_stats"):
+                        st.subheader("Step Statistics")
+                        step_stats = task_detail.get("step_stats", [])
+                        if step_stats:
+                            for s in step_stats:
+                                with st.expander(f"Step {s.get('step_order', 0) + 1}: {s.get('strategy', '')}", expanded=True):
+                                    c1, c2, c3 = st.columns(3)
+                                    c1.metric("Input", s.get("input_count", 0))
+                                    c2.metric("Success", s.get("success_count", 0))
+                                    c3.metric("Skipped", s.get("skipped_count", 0))
+
+                    if task_detail.get("is_composite") and task_detail.get("current_step_index") is not None:
+                        st.info(f"Current step: Step {task_detail.get('current_step_index', 0) + 1}")
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    action = st.selectbox("Action", ["pause", "resume", "cancel"])
+                with col2:
+                    if st.button("Execute Action", type="primary"):
+                        result = api_post(f"/augmentation/tasks/{tid}/action", data={"action": action})
+                        st.json(result)
         else:
             st.info("No augmentation tasks yet.")
 

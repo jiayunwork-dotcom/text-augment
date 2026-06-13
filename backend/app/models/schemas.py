@@ -166,12 +166,41 @@ class TemplateGenerateParams(BaseModel):
     seed_count: Optional[int] = None
 
 
+class AugmentationStepCreate(BaseModel):
+    strategy: str
+    strategy_params: dict = {}
+
+
+class AugmentationStepResponse(BaseModel):
+    id: int
+    task_id: int
+    step_order: int
+    strategy: str
+    strategy_params: dict
+    input_count: int = 0
+    success_count: int = 0
+    skipped_count: int = 0
+
+    class Config:
+        from_attributes = True
+
+
+class StepStat(BaseModel):
+    step_order: int
+    strategy: str
+    input_count: int
+    success_count: int
+    skipped_count: int
+
+
 class AugmentationTaskCreate(BaseModel):
     dataset_id: int
     source_version_id: int
     strategy: str
     strategy_params: dict = {}
     augmentation_multiplier: float = Field(default=1.0, ge=0.1, le=10.0)
+    is_composite: bool = False
+    steps: list[AugmentationStepCreate] = []
 
 
 class AugmentationTaskResponse(BaseModel):
@@ -189,9 +218,35 @@ class AugmentationTaskResponse(BaseModel):
     error_message: Optional[str] = None
     estimated_remaining_seconds: Optional[float] = None
     created_at: datetime
+    is_composite: bool = False
+    current_step_index: int = 0
+    step_stats: list[StepStat] = []
+    steps: list[AugmentationStepResponse] = []
 
     class Config:
         from_attributes = True
+
+
+class PreviewRequest(BaseModel):
+    source_version_id: int
+    strategy: str
+    strategy_params: dict = {}
+
+
+class PreviewSampleResult(BaseModel):
+    original_text: str
+    augmented_text: Optional[str] = None
+    timed_out: bool = False
+    error: Optional[str] = None
+
+
+class PreviewResponse(BaseModel):
+    strategy: str
+    strategy_params: dict
+    samples: list[PreviewSampleResult]
+    total_count: int
+    success_count: int
+    timed_out_count: int
 
 
 class FilterTaskCreate(BaseModel):

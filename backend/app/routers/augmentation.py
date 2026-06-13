@@ -4,8 +4,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..database import get_session
-from ..models.db_models import AugmentationTask, TaskStatus
-from ..models.schemas import AugmentationTaskCreate, AugmentationTaskResponse, TaskActionRequest
+from ..models.db_models import AugmentationTask, TaskStatus, AugmentationStep
+from ..models.schemas import (
+    AugmentationTaskCreate, AugmentationTaskResponse, TaskActionRequest,
+    PreviewRequest, PreviewResponse,
+)
 from ..services import augmentation as aug_service
 from ..services import business_rules
 
@@ -18,24 +21,65 @@ async def create_augmentation_task(
     background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
 ):
-    if request.strategy == "back_translation":
-        source_lang = request.strategy_params.get("source_language", "en")
-        pivot_lang = request.strategy_params.get("pivot_language", "fr")
-        validation = business_rules.validate_back_translation_pair(source_lang, pivot_lang)
+    is_composite = request.is_composite and request.steps
+
+    if is_composite:
+        steps_dicts = [{"strategy": s.strategy, "strategy_params": s.strategy_params} for s in request.steps]
+        validation = aug_service.validate_composite_strategy(steps_dicts)
         if not validation["valid"]:
             raise HTTPException(status_code=400, detail=validation["reason"])
 
-    task = AugmentationTask(
-        dataset_id=request.dataset_id,
-        source_version_id=request.source_version_id,
-        strategy=request.strategy,
-        strategy_params=request.strategy_params,
-        augmentation_multiplier=request.augmentation_multiplier,
-        status=TaskStatus.pending,
-    )
-    session.add(task)
-    await session.commit()
-    await session.refresh(task)
+        for step in request.steps:
+            if step.strategy == "back_translation":
+                source_lang = step.strategy_params.get("source_language", "en")
+                pivot_lang = step.strategy_params.get("pivot_language", "fr")
+                bt_validation = business_rules.validate_back_translation_pair(source_lang, pivot_lang)
+                if not bt_validation["valid"]:
+                    raise HTTPException(status_code=400, detail=bt_validation["reason"])
+
+        task = AugmentationTask(
+            dataset_id=request.dataset_id,
+            source_version_id=request.source_version_id,
+            strategy="composite",
+            strategy_params={},
+            augmentation_multiplier=request.augmentation_multiplier,
+            status=TaskStatus.pending,
+            is_composite=True,
+        )
+        session.add(task)
+        await session.flush()
+
+        for i, step in enumerate(request.steps):
+            db_step = AugmentationStep(
+                task_id=task.id,
+                step_order=i,
+                strategy=step.strategy,
+                strategy_params=step.strategy_params,
+            )
+            session.add(db_step)
+
+        await session.commit()
+        await session.refresh(task)
+    else:
+        if request.strategy == "back_translation":
+            source_lang = request.strategy_params.get("source_language", "en")
+            pivot_lang = request.strategy_params.get("pivot_language", "fr")
+            validation = business_rules.validate_back_translation_pair(source_lang, pivot_lang)
+            if not validation["valid"]:
+                raise HTTPException(status_code=400, detail=validation["reason"])
+
+        task = AugmentationTask(
+            dataset_id=request.dataset_id,
+            source_version_id=request.source_version_id,
+            strategy=request.strategy,
+            strategy_params=request.strategy_params,
+            augmentation_multiplier=request.augmentation_multiplier,
+            status=TaskStatus.pending,
+            is_composite=False,
+        )
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
 
     background_tasks.add_task(_run_augmentation, task.id)
 
@@ -66,7 +110,10 @@ async def get_augmentation_task(
     task_id: int,
     session: AsyncSession = Depends(get_session),
 ):
-    stmt = select(AugmentationTask).where(AugmentationTask.id == task_id)
+    from sqlalchemy.orm import selectinload
+    stmt = select(AugmentationTask).where(AugmentationTask.id == task_id).options(
+        selectinload(AugmentationTask.steps)
+    )
     result = await session.execute(stmt)
     task = result.scalar_one_or_none()
     if not task:
@@ -101,3 +148,24 @@ async def task_action(
 
     await session.commit()
     return {"task_id": task_id, "status": task.status.value}
+
+
+@router.post("/preview", response_model=PreviewResponse)
+async def preview_augmentation(
+    request: PreviewRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    try:
+        result = await aug_service.preview_augmentation(
+            session=session,
+            source_version_id=request.source_version_id,
+            strategy=request.strategy,
+            strategy_params=request.strategy_params,
+        )
+        return PreviewResponse(**result)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger = __import__("logging").getLogger(__name__)
+        logger.exception(f"Preview failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

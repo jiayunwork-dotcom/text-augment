@@ -27,6 +27,9 @@ class AugmentationTaskState:
         self.processed = 0
         self.total = 0
         self.start_time: Optional[float] = None
+        self.current_step_index = 0
+        self.current_step_processed = 0
+        self.current_step_total = 0
 
 
 def get_task_state(task_id: int) -> AugmentationTaskState:
@@ -384,6 +387,35 @@ AUGMENTERS = {
 }
 
 
+def validate_composite_strategy(steps: list[dict]) -> dict:
+    if not steps:
+        return {"valid": False, "reason": "Composite strategy must have at least one step"}
+
+    strategies = [s["strategy"] for s in steps]
+
+    for s in strategies:
+        if s not in AUGMENTERS:
+            return {"valid": False, "reason": f"Unknown strategy in steps: {s}"}
+
+    if "back_translation" in strategies and strategies[0] != "back_translation":
+        return {
+            "valid": False,
+            "reason": "Back-translation must be the first step in a composite strategy, "
+                      "as it requires the complete original sentence as input."
+        }
+
+    for i in range(len(steps) - 1):
+        if steps[i]["strategy"] == "random_ops" and steps[i + 1]["strategy"] == "context_augment":
+            return {
+                "valid": False,
+                "reason": f"Context augmentation (MLM) cannot immediately follow random deletion at step {i + 1}. "
+                          "Random deletion may produce incomplete sentences that affect BERT prediction quality. "
+                          "Please add another strategy between them or reorder."
+            }
+
+    return {"valid": True}
+
+
 async def execute_augmentation_task(
     session: AsyncSession,
     task_id: int,
@@ -392,6 +424,10 @@ async def execute_augmentation_task(
     result = await session.execute(stmt)
     task = result.scalar_one_or_none()
     if not task:
+        return
+
+    if task.is_composite:
+        await execute_composite_augmentation_task(session, task_id)
         return
 
     task.status = TaskStatus.running
@@ -546,3 +582,269 @@ async def cancel_task(task_id: int) -> bool:
     state = get_task_state(task_id)
     state.cancelled = True
     return True
+
+
+async def preview_augmentation(
+    session: AsyncSession,
+    source_version_id: int,
+    strategy: str,
+    strategy_params: dict,
+    sample_count: int = 5,
+    timeout_seconds: int = 10,
+) -> dict:
+    stmt = select(Sample).where(
+        Sample.version_id == source_version_id,
+        Sample.is_filtered == False,
+    )
+    result = await session.execute(stmt)
+    all_samples = result.scalars().all()
+
+    if not all_samples:
+        return {
+            "strategy": strategy,
+            "strategy_params": strategy_params,
+            "samples": [],
+            "total_count": 0,
+            "success_count": 0,
+            "timed_out_count": 0,
+        }
+
+    samples = random.sample(list(all_samples), min(sample_count, len(all_samples)))
+
+    augmenter = AUGMENTERS.get(strategy)
+    if not augmenter:
+        raise ValueError(f"Unknown strategy: {strategy}")
+
+    results = []
+    success_count = 0
+    timed_out_count = 0
+
+    for sample in samples:
+        sample_result = {
+            "original_text": sample.text,
+            "augmented_text": None,
+            "timed_out": False,
+            "error": None,
+        }
+
+        try:
+            aug_coro = augmenter.augment(sample.text, sample.label, strategy_params)
+            new_texts = await asyncio.wait_for(aug_coro, timeout=timeout_seconds)
+            if new_texts:
+                sample_result["augmented_text"] = new_texts[0]
+                success_count += 1
+        except asyncio.TimeoutError:
+            sample_result["timed_out"] = True
+            timed_out_count += 1
+        except Exception as e:
+            sample_result["error"] = str(e)
+
+        results.append(sample_result)
+
+    return {
+        "strategy": strategy,
+        "strategy_params": strategy_params,
+        "samples": results,
+        "total_count": len(results),
+        "success_count": success_count,
+        "timed_out_count": timed_out_count,
+    }
+
+
+async def execute_composite_augmentation_task(
+    session: AsyncSession,
+    task_id: int,
+) -> None:
+    from ..models.db_models import AugmentationStep
+
+    stmt = select(AugmentationTask).where(AugmentationTask.id == task_id)
+    result = await session.execute(stmt)
+    task = result.scalar_one_or_none()
+    if not task:
+        return
+
+    task.status = TaskStatus.running
+    task.started_at = __import__("datetime").datetime.utcnow()
+    await session.commit()
+
+    state = get_task_state(task_id)
+    state.start_time = time.time()
+
+    try:
+        stmt_samples = select(Sample).where(
+            Sample.version_id == task.source_version_id,
+            Sample.is_filtered == False,
+        )
+        result_samples = await session.execute(stmt_samples)
+        original_samples = result_samples.scalars().all()
+
+        if not original_samples:
+            task.status = TaskStatus.completed
+            task.completed_at = __import__("datetime").datetime.utcnow()
+            await session.commit()
+            return
+
+        total = len(original_samples)
+        state.total = total
+        task.total_samples = total
+        await session.commit()
+
+        target_version = DatasetVersion(
+            dataset_id=(await session.execute(select(DatasetVersion).where(DatasetVersion.id == task.source_version_id))).scalar_one().dataset_id,
+            version_name=f"composite_augmented",
+            version_type="augmented",
+            parent_version_id=task.source_version_id,
+            split_ratios={},
+        )
+        session.add(target_version)
+        await session.flush()
+        task.target_version_id = target_version.id
+        await session.commit()
+
+        steps_stmt = select(AugmentationStep).where(
+            AugmentationStep.task_id == task_id
+        ).order_by(AugmentationStep.step_order)
+        steps_result = await session.execute(steps_stmt)
+        steps = steps_result.scalars().all()
+
+        if not steps:
+            task.status = TaskStatus.failed
+            task.error_message = "No steps found for composite task"
+            await session.commit()
+            return
+
+        num_steps = len(steps)
+        step_stats = []
+
+        for sample in original_samples:
+            new_sample = Sample(
+                version_id=target_version.id,
+                text=sample.text,
+                label=sample.label,
+                split=sample.split,
+                source=SampleSource.original,
+                source_sample_id=sample.id,
+            )
+            session.add(new_sample)
+
+        await session.flush()
+
+        current_texts = [(sample.id, sample.text, sample.label, sample.split) for sample in original_samples]
+        generated_count_per_step = [0] * num_steps
+
+        for step_idx, step in enumerate(steps):
+            state.current_step_index = step_idx
+            state.current_step_processed = 0
+            state.current_step_total = len(current_texts)
+            task.current_step_index = step_idx
+            step.input_count = len(current_texts)
+            await session.commit()
+
+            augmenter = AUGMENTERS.get(step.strategy)
+            if not augmenter:
+                task.status = TaskStatus.failed
+                task.error_message = f"Unknown strategy in step {step_idx}: {step.strategy}"
+                await session.commit()
+                return
+
+            step_params = dict(step.strategy_params)
+            if step.strategy == "template_generation":
+                source_samples_for_template = [
+                    {"text": t[1], "label": t[2]} for t in current_texts
+                ]
+                step_params["sample_pool"] = source_samples_for_template
+
+            next_texts = []
+            success_count = 0
+            skipped_count = 0
+
+            for i, (orig_id, text, label, split) in enumerate(current_texts):
+                if state.cancelled:
+                    task.status = TaskStatus.failed
+                    task.error_message = "Cancelled by user"
+                    await session.commit()
+                    return
+
+                while state.paused:
+                    await asyncio.sleep(1)
+
+                try:
+                    new_texts = await augmenter.augment(text, label, step_params)
+                except Exception as e:
+                    logger.warning(f"Augmentation step {step_idx} failed for sample {orig_id}: {e}")
+                    new_texts = []
+
+                if new_texts:
+                    for new_text in new_texts[:1]:
+                        next_texts.append((orig_id, new_text, label, split))
+                        success_count += 1
+                        generated_count_per_step[step_idx] += 1
+
+                        if step_idx == num_steps - 1:
+                            new_sample = Sample(
+                                version_id=target_version.id,
+                                text=new_text,
+                                label=label,
+                                split=split,
+                                source=SampleSource(step.strategy),
+                                source_sample_id=orig_id,
+                            )
+                            session.add(new_sample)
+                else:
+                    next_texts.append((orig_id, text, label, split))
+                    skipped_count += 1
+
+                state.current_step_processed = i + 1
+                state.processed = int(
+                    (step_idx + state.current_step_processed / state.current_step_total) / num_steps * state.total
+                )
+                task.processed_samples = state.processed
+                task.generated_samples = sum(generated_count_per_step)
+
+                elapsed = time.time() - state.start_time
+                if state.processed > 0:
+                    rate = elapsed / state.processed
+                    task.estimated_remaining_seconds = rate * (state.total - state.processed)
+
+                if i % 10 == 0:
+                    await session.commit()
+                    await asyncio.sleep(0)
+
+            step.success_count = success_count
+            step.skipped_count = skipped_count
+            step_stats.append({
+                "step_order": step.step_order,
+                "strategy": step.strategy,
+                "input_count": step.input_count,
+                "success_count": success_count,
+                "skipped_count": skipped_count,
+            })
+            task.step_stats = step_stats
+            current_texts = next_texts
+            await session.commit()
+
+        class_dist = Counter()
+        stmt_count = select(Sample).where(Sample.version_id == target_version.id)
+        count_result = await session.execute(stmt_count)
+        all_samples = count_result.scalars().all()
+        for s in all_samples:
+            class_dist[s.label] += 1
+
+        target_version.total_samples = len(all_samples)
+        target_version.class_distribution = dict(class_dist)
+        target_version.split_ratios = (
+            (await session.execute(select(DatasetVersion).where(DatasetVersion.id == task.source_version_id)))
+            .scalar_one().split_ratios
+        )
+
+        task.status = TaskStatus.completed
+        task.completed_at = __import__("datetime").datetime.utcnow()
+        await session.commit()
+
+    except Exception as e:
+        logger.exception(f"Composite augmentation task {task_id} failed")
+        task.status = TaskStatus.failed
+        task.error_message = str(e)
+        await session.commit()
+    finally:
+        remove_task_state(task_id)

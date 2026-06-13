@@ -130,9 +130,28 @@ class AugmentationTask(Base):
     completed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     estimated_remaining_seconds = Column(Float, nullable=True)
+    is_composite = Column(Boolean, default=False)
+    current_step_index = Column(Integer, default=0)
+    step_stats = Column(JSON, default=list)
 
     source_version = relationship("DatasetVersion", foreign_keys=[source_version_id])
     target_version = relationship("DatasetVersion", foreign_keys=[target_version_id])
+    steps = relationship("AugmentationStep", back_populates="task", cascade="all, delete-orphan", order_by="AugmentationStep.step_order")
+
+
+class AugmentationStep(Base):
+    __tablename__ = "augmentation_steps"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(Integer, ForeignKey("augmentation_tasks.id", ondelete="CASCADE"), nullable=False)
+    step_order = Column(Integer, nullable=False)
+    strategy = Column(String(50), nullable=False)
+    strategy_params = Column(JSON, default=dict)
+    input_count = Column(Integer, default=0)
+    success_count = Column(Integer, default=0)
+    skipped_count = Column(Integer, default=0)
+
+    task = relationship("AugmentationTask", back_populates="steps")
 
 
 class FilterTask(Base):
