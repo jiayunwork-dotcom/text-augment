@@ -633,11 +633,13 @@ async def preview_augmentation(
             if new_texts:
                 sample_result["augmented_text"] = new_texts[0]
                 success_count += 1
+            else:
+                sample_result["error"] = "No augmentation produced: strategy returned empty result (text may be too short, no synonyms found, or input unchanged)"
         except asyncio.TimeoutError:
             sample_result["timed_out"] = True
             timed_out_count += 1
         except Exception as e:
-            sample_result["error"] = str(e)
+            sample_result["error"] = f"Augmentation failed with exception: {type(e).__name__}: {str(e)}"
 
         results.append(sample_result)
 
