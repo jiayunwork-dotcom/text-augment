@@ -752,10 +752,24 @@ async def execute_training(
     session: AsyncSession,
     experiment_id: int,
 ) -> None:
+    from . import business_rules
+
     stmt = select(TrainingExperiment).where(TrainingExperiment.id == experiment_id)
     result = await session.execute(stmt)
     experiment = result.scalar_one_or_none()
     if not experiment:
+        return
+
+    version_stmt = select(DatasetVersion).where(DatasetVersion.id == experiment.version_id)
+    version = (await session.execute(version_stmt)).scalar_one()
+    dataset_stmt = select(Dataset).where(Dataset.id == version.dataset_id)
+    dataset = (await session.execute(dataset_stmt)).scalar_one()
+
+    filter_check = await business_rules.check_version_filtered(session, experiment.version_id)
+    if not filter_check["valid"]:
+        experiment.status = TaskStatus.failed
+        experiment.error_message = filter_check["reason"]
+        await session.commit()
         return
 
     experiment.status = TaskStatus.running
@@ -763,11 +777,6 @@ async def execute_training(
     await session.commit()
 
     try:
-        version_stmt = select(DatasetVersion).where(DatasetVersion.id == experiment.version_id)
-        version = (await session.execute(version_stmt)).scalar_one()
-        dataset_stmt = select(Dataset).where(Dataset.id == version.dataset_id)
-        dataset = (await session.execute(dataset_stmt)).scalar_one()
-
         sample_stmt = select(Sample).where(
             Sample.version_id == experiment.version_id,
             Sample.is_filtered == False,
@@ -852,16 +861,23 @@ async def execute_training(
                     orig_train_labels = combined_labels
 
         elif experiment.training_mode == TrainingMode.semi_supervised:
+            if not experiment.unlabeled_version_id:
+                raise ValueError("Semi-supervised training requires unlabeled_version_id")
+
             result = await trainer.train(train_ds, val_ds)
             if result:
                 trainer.hyperparams["_model_path"] = result["model_path"]
 
             unlabeled_stmt = select(Sample).where(
-                Sample.version_id == experiment.version_id,
-                Sample.source == SampleSource.original,
+                Sample.version_id == experiment.unlabeled_version_id,
+                Sample.source == SampleSource.unlabeled,
                 Sample.is_filtered == False,
             )
             unlabeled_samples = (await session.execute(unlabeled_stmt)).scalars().all()
+
+            if not unlabeled_samples:
+                logger.warning("No unlabeled samples found for semi-supervised training")
+                unlabeled_samples = []
 
             best_val_metric = result.get("best_val_metric", 0) if result else 0
             no_improve_rounds = 0

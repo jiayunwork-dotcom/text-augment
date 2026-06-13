@@ -47,6 +47,7 @@ class SampleSource(str, Enum):
     template_generation = "template_generation"
     oversampling = "oversampling"
     pseudo_label = "pseudo_label"
+    unlabeled = "unlabeled"
 
 
 class DatasetCreate(BaseModel):
@@ -100,6 +101,12 @@ class DatasetImportResponse(BaseModel):
     num_classes: int
     class_distribution: dict
     imbalance_ratio: float
+
+
+class UnlabeledImportResponse(BaseModel):
+    dataset_id: int
+    version_id: int
+    total_samples: int
 
 
 class SplitRequest(BaseModel):

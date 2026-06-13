@@ -117,6 +117,83 @@ def _assign_splits(n: int, ratios: tuple, seed: int) -> list[SplitType]:
     return splits
 
 
+async def import_unlabeled(
+    session: AsyncSession,
+    dataset_id: int,
+    file_content: bytes,
+    file_format: str,
+    text_column: str = "text",
+) -> dict:
+    texts = _parse_unlabeled_file(file_content, file_format, text_column)
+    if not texts:
+        raise ValueError("No valid unlabeled samples found in uploaded file")
+
+    stmt = select(Dataset).where(Dataset.id == dataset_id)
+    result = await session.execute(stmt)
+    dataset = result.scalar_one_or_none()
+    if not dataset:
+        raise ValueError("Dataset not found")
+
+    version = DatasetVersion(
+        dataset_id=dataset_id,
+        version_name="unlabeled",
+        version_type="unlabeled",
+        total_samples=len(texts),
+        class_distribution={},
+        split_ratios={"train": 1.0, "val": 0.0, "test": 0.0},
+    )
+    session.add(version)
+    await session.flush()
+
+    for text in texts:
+        sample = Sample(
+            version_id=version.id,
+            text=text,
+            label="__unlabeled__",
+            split=SplitType.train,
+            source=SampleSource.unlabeled,
+        )
+        session.add(sample)
+
+    await session.commit()
+
+    return {
+        "dataset_id": dataset_id,
+        "version_id": version.id,
+        "total_samples": len(texts),
+    }
+
+
+def _parse_unlabeled_file(file_content: bytes, file_format: str, text_column: str) -> list[str]:
+    texts = []
+    if file_format == "csv":
+        text = file_content.decode("utf-8-sig")
+        reader = csv.DictReader(io.StringIO(text))
+        for row in reader:
+            text_val = row.get(text_column, "").strip()
+            if text_val:
+                texts.append(text_val)
+    elif file_format == "json":
+        data = json.loads(file_content.decode("utf-8"))
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    text_val = str(item.get(text_column, "")).strip()
+                    if text_val:
+                        texts.append(text_val)
+        elif isinstance(data, dict):
+            text_val = str(data.get(text_column, "")).strip()
+            if text_val:
+                texts.append(text_val)
+    elif file_format == "txt":
+        text = file_content.decode("utf-8")
+        for line in text.split("\n"):
+            line = line.strip()
+            if line:
+                texts.append(line)
+    return texts
+
+
 async def list_datasets(session: AsyncSession) -> list[dict]:
     stmt = select(Dataset).options(selectinload(Dataset.versions)).order_by(Dataset.created_at.desc())
     result = await session.execute(stmt)

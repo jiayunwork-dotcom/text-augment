@@ -88,7 +88,7 @@ if page == "📊 Dashboard":
 elif page == "📁 Datasets":
     st.title("📁 Dataset Management")
 
-    tab_upload, tab_list, tab_detail = st.tabs(["Upload", "List", "Detail"])
+    tab_upload, tab_unlabeled, tab_list, tab_detail = st.tabs(["Upload", "Import Unlabeled", "List", "Detail"])
 
     with tab_upload:
         st.subheader("Upload Dataset")
@@ -125,6 +125,33 @@ elif page == "📁 Datasets":
                 else:
                     st.success(f"Dataset imported! ID: {result.get('dataset_id')}, Samples: {result.get('total_samples')}")
                     st.json(result)
+
+    with tab_unlabeled:
+        st.subheader("Import Unlabeled Data (for Semi-supervised Training)")
+        datasets = api_get("/datasets") or []
+        if not datasets:
+            st.warning("No datasets available. Please upload a labeled dataset first.")
+        else:
+            ds_opts = {f"{d['id']}: {d['name']}": d["id"] for d in datasets}
+            sel_ds = st.selectbox("Select Dataset", list(ds_opts.keys()), key="unlabeled_ds")
+            ds_id = ds_opts[sel_ds]
+
+            ul_file_format = st.selectbox("File Format", ["csv", "json", "txt"], key="ul_format")
+            ul_text_col = st.text_input("Text Column", "text", key="ul_text_col")
+
+            ul_file = st.file_uploader("Upload Unlabeled File", type=["csv", "json", "txt"], key="ul_file")
+            if st.button("Import Unlabeled Data") and ul_file:
+                with st.spinner("Importing unlabeled data..."):
+                    files = {"file": (ul_file.name, ul_file.getvalue(), "application/octet-stream")}
+                    data = {
+                        "text_column": ul_text_col,
+                    }
+                    result = api_post(f"/datasets/{ds_id}/import-unlabeled", data=data, files=files)
+                    if "error" in result:
+                        st.error(f"Import failed: {result['error']}")
+                    else:
+                        st.success(f"Unlabeled data imported! Version ID: {result.get('version_id')}, Samples: {result.get('total_samples')}")
+                        st.json(result)
 
     with tab_list:
         st.subheader("All Datasets")
@@ -246,11 +273,29 @@ elif page == "🔧 Augmentation":
                 params["language"] = st.selectbox("Language", ["en"], key="rand_lang")
 
             elif strategy == "back_translation":
-                params["source_language"] = st.selectbox("Source Language", ["en", "zh"], key="bt_src")
-                pivot_options = {"en": ["fr", "zh", "ja"], "zh": ["en", "ja"]}
-                pivots = pivot_options.get(params["source_language"], ["en"])
-                params["pivot_language"] = st.selectbox("Pivot Language", pivots)
+                params["source_language"] = st.selectbox("Source Language", ["en", "zh", "de", "fr", "ja"], key="bt_src")
+                use_custom_pivot = st.checkbox("Use custom pivot language (advanced)", value=False)
+                if use_custom_pivot:
+                    params["pivot_language"] = st.text_input(
+                        "Pivot Language Code",
+                        value="fr",
+                        help="e.g., 'fr' for French, 'es' for Spanish, 'de' for German. "
+                             "Note: Pivot must be from a different language family than source."
+                    )
+                else:
+                    pivot_options = {
+                        "en": ["fr", "de", "es", "zh", "ja"],
+                        "zh": ["en", "fr", "de", "ja"],
+                        "de": ["fr", "es", "zh", "ja"],
+                        "fr": ["en", "de", "zh", "ja"],
+                        "ja": ["en", "zh", "fr", "de"],
+                    }
+                    pivots = pivot_options.get(params["source_language"], ["en", "fr"])
+                    params["pivot_language"] = st.selectbox("Pivot Language", pivots)
                 params["num_variants"] = st.number_input("Number of Variants", 1, 5, 1)
+
+                st.info(f"💡 Source language '{params['source_language']}' family check will be performed. "
+                        "Same-family pairs (e.g., en-de) will be rejected.")
 
             elif strategy == "context_augment":
                 params["mask_ratio"] = st.slider("Mask Ratio", 0.05, 0.5, 0.15, 0.05)
@@ -377,19 +422,37 @@ elif page == "🏋️ Training":
                 ds_map[d['id']] = d['name']
                 if detail:
                     for v in detail.get("versions", []):
-                        all_versions.append({
-                            "id": v["id"],
-                            "dataset_id": d["id"],
-                            "name": f"v{v['id']}: {d['name']} / {v['version_name']} ({v.get('total_samples',0)} samples)",
-                        })
+                        if v.get("version_type") != "unlabeled":
+                            vtype = v.get("version_type", "original")
+                            status_icon = "✅" if vtype == "filtered" else "⚠️" if vtype == "augmented" else "⚠️"
+                            all_versions.append({
+                                "id": v["id"],
+                                "dataset_id": d["id"],
+                                "version_type": vtype,
+                                "name": f"{status_icon} v{v['id']}: {d['name']} / {v['version_name']} [{vtype}] ({v.get('total_samples',0)} samples)",
+                            })
 
             exp_name = st.text_input("Experiment Name", value="experiment_1")
 
             if all_versions:
+                filtered_only = [v for v in all_versions if v["version_type"] == "filtered"]
+                non_filtered = [v for v in all_versions if v["version_type"] != "filtered"]
+
+                if filtered_only:
+                    st.success(f"✅ {len(filtered_only)} filtered version(s) available for training")
+                if non_filtered:
+                    st.warning(f"⚠️ {len(non_filtered)} version(s) not yet filtered - cannot be used for training")
+
                 v_opts = {v["name"]: v["id"] for v in all_versions}
                 sel_v = st.selectbox("Dataset Version", list(v_opts.keys()))
                 v_id = v_opts[sel_v]
+                sel_version = next(v for v in all_versions if v["id"] == v_id)
                 sel_ds_id = next(v["dataset_id"] for v in all_versions if v["id"] == v_id)
+
+                if sel_version["version_type"] != "filtered":
+                    st.error(f"❌ Selected version is of type '{sel_version['version_type']}'. "
+                             "Only 'filtered' versions can be used for training. "
+                             "Please run a quality filter task on this version first.")
 
                 training_mode = st.selectbox(
                     "Training Mode",
@@ -399,6 +462,27 @@ elif page == "🏋️ Training":
                     "Model Backbone",
                     ["distilbert", "tinybert", "textcnn", "bilstm_attention"],
                 )
+
+                unlabeled_version_id = None
+                if training_mode == "semi_supervised":
+                    st.info("📋 Semi-supervised training requires an unlabeled data version.")
+                    unlabeled_versions = []
+                    for d in datasets:
+                        detail = api_get(f"/datasets/{d['id']}")
+                        if detail:
+                            for v in detail.get("versions", []):
+                                if v.get("version_type") == "unlabeled":
+                                    unlabeled_versions.append({
+                                        "id": v["id"],
+                                        "name": f"v{v['id']}: {d['name']} / {v['version_name']} ({v.get('total_samples',0)} samples)",
+                                    })
+
+                    if unlabeled_versions:
+                        ul_opts = {v["name"]: v["id"] for v in unlabeled_versions}
+                        sel_ul = st.selectbox("Unlabeled Version", list(ul_opts.keys()), key="sel_ul")
+                        unlabeled_version_id = ul_opts[sel_ul]
+                    else:
+                        st.warning("⚠️ No unlabeled versions available. Please import unlabeled data first in the Datasets tab.")
 
                 st.subheader("Hyperparameters")
                 lr = st.number_input("Learning Rate", 1e-7, 1e-2, 2e-5, format="%e")
@@ -412,26 +496,30 @@ elif page == "🏋️ Training":
                     aug_multiplier = st.selectbox("Augmentation Multiplier", [0.5, 1.0, 2.0, 3.0], index=1)
 
                 if st.button("Start Training"):
-                    payload = {
-                        "experiment_name": exp_name,
-                        "dataset_id": sel_ds_id,
-                        "version_id": v_id,
-                        "training_mode": training_mode,
-                        "backbone": backbone,
-                        "hyperparams": {
-                            "learning_rate": lr,
-                            "batch_size": batch_size,
-                            "epochs": epochs,
-                            "early_stopping_patience": patience,
-                            "max_seq_length": max_seq,
-                        },
-                        "augmentation_multiplier": aug_multiplier,
-                    }
-                    result = api_post("/training/experiments", data=payload)
-                    if "error" in result:
-                        st.error(f"Failed: {result['error']}")
+                    if training_mode == "semi_supervised" and unlabeled_version_id is None:
+                        st.error("Please select an unlabeled version for semi-supervised training.")
                     else:
-                        st.success(f"Experiment created! ID: {result.get('id')}")
+                        payload = {
+                            "experiment_name": exp_name,
+                            "dataset_id": sel_ds_id,
+                            "version_id": v_id,
+                            "unlabeled_version_id": unlabeled_version_id,
+                            "training_mode": training_mode,
+                            "backbone": backbone,
+                            "hyperparams": {
+                                "learning_rate": lr,
+                                "batch_size": batch_size,
+                                "epochs": epochs,
+                                "early_stopping_patience": patience,
+                                "max_seq_length": max_seq,
+                            },
+                            "augmentation_multiplier": aug_multiplier,
+                        }
+                        result = api_post("/training/experiments", data=payload)
+                        if "error" in result:
+                            st.error(f"Failed: {result['error']}")
+                        else:
+                            st.success(f"Experiment created! ID: {result.get('id')}")
             else:
                 st.warning("No versions available.")
 

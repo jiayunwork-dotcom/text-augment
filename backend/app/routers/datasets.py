@@ -6,7 +6,7 @@ from ..database import get_session
 from ..services import dataset as dataset_service
 from ..models.schemas import (
     DatasetImportResponse, DatasetResponse, SplitRequest,
-    SampleApprovalRequest, VersionComparison,
+    SampleApprovalRequest, VersionComparison, UnlabeledImportResponse,
 )
 
 router = APIRouter(prefix="/datasets", tags=["datasets"])
@@ -41,6 +41,32 @@ async def import_dataset(
             label_column=label_column,
             split_ratios=(train_ratio, val_ratio, test_ratio),
             random_seed=random_seed,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/{dataset_id}/import-unlabeled", response_model=UnlabeledImportResponse)
+async def import_unlabeled_data(
+    dataset_id: int,
+    file: UploadFile = File(...),
+    text_column: str = Form("text"),
+    session: AsyncSession = Depends(get_session),
+):
+    content = await file.read()
+    filename = file.filename or ""
+    file_format = filename.split(".")[-1].lower()
+    if file_format not in ("csv", "json", "txt"):
+        raise HTTPException(status_code=400, detail="File format must be csv, json or txt")
+
+    try:
+        result = await dataset_service.import_unlabeled(
+            session=session,
+            dataset_id=dataset_id,
+            file_content=content,
+            file_format=file_format,
+            text_column=text_column,
         )
         return result
     except ValueError as e:

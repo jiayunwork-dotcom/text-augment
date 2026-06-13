@@ -69,32 +69,47 @@ class SynonymReplaceAugmenter(BaseAugmenter):
             self._nltk_ready = True
         except Exception as e:
             logger.warning(f"NLTK init failed: {e}")
-            self._nltk_ready = True
+            self._nltk_ready = False
 
     async def augment(self, text: str, label: str, params: dict) -> list[str]:
         language = params.get("language", "en")
         replace_ratio = params.get("replace_ratio", 0.1)
 
-        if language == "zh":
-            return self._augment_chinese(text, replace_ratio)
-        return self._augment_english(text, replace_ratio)
+        try:
+            if language == "zh":
+                result = self._augment_chinese(text, replace_ratio)
+            else:
+                result = self._augment_english(text, replace_ratio)
+            return [r for r in result if r.strip() and r.strip() != text.strip()]
+        except Exception as e:
+            logger.warning(f"Synonym replacement failed: {e}")
+            return []
 
     def _augment_english(self, text: str, replace_ratio: float) -> list[str]:
+        try:
+            from nltk.corpus import wordnet
+        except Exception as e:
+            logger.warning(f"NLTK WordNet not available: {e}")
+            return []
+
         self._ensure_nltk()
-        from nltk.corpus import wordnet
+        if not self._nltk_ready:
+            logger.warning("NLTK not ready, skipping synonym replacement")
+            return []
 
         words = text.split()
         if not words:
-            return [text]
+            return []
 
         non_stop_indices = [i for i, w in enumerate(words) if w.lower() not in self._stopwords and w.isalpha()]
         if not non_stop_indices:
-            return [text]
+            return []
 
         num_replace = max(1, int(len(non_stop_indices) * replace_ratio))
         replace_indices = random.sample(non_stop_indices, min(num_replace, len(non_stop_indices)))
 
         new_words = words.copy()
+        changed = False
         for idx in replace_indices:
             synsets = wordnet.synsets(words[idx])
             synonyms = []
@@ -104,29 +119,40 @@ class SynonymReplaceAugmenter(BaseAugmenter):
                     if name.lower() != words[idx].lower() and name.isalpha():
                         synonyms.append(name)
             if synonyms:
-                new_words[idx] = random.choice(synonyms)
+                new_word = random.choice(synonyms)
+                if new_word != new_words[idx]:
+                    new_words[idx] = new_word
+                    changed = True
 
-        return [" ".join(new_words)]
+        return [" ".join(new_words)] if changed else []
 
     def _augment_chinese(self, text: str, replace_ratio: float) -> list[str]:
-        if self._cn_synonym_dict is None:
-            self._cn_synonym_dict = self._load_chinese_synonyms()
+        try:
+            if self._cn_synonym_dict is None:
+                self._cn_synonym_dict = self._load_chinese_synonyms()
 
-        chars = list(text)
-        replaceable = [i for i, c in enumerate(chars) if '\u4e00' <= c <= '\u9fff']
-        if not replaceable:
-            return [text]
+            chars = list(text)
+            replaceable = [i for i, c in enumerate(chars) if '\u4e00' <= c <= '\u9fff']
+            if not replaceable:
+                return []
 
-        num_replace = max(1, int(len(replaceable) * replace_ratio))
-        replace_indices = random.sample(replaceable, min(num_replace, len(replaceable)))
+            num_replace = max(1, int(len(replaceable) * replace_ratio))
+            replace_indices = random.sample(replaceable, min(num_replace, len(replaceable)))
 
-        new_chars = chars.copy()
-        for idx in replace_indices:
-            synonyms = self._cn_synonym_dict.get(chars[idx], [])
-            if synonyms:
-                new_chars[idx] = random.choice(synonyms)
+            new_chars = chars.copy()
+            changed = False
+            for idx in replace_indices:
+                synonyms = self._cn_synonym_dict.get(chars[idx], [])
+                if synonyms:
+                    new_char = random.choice(synonyms)
+                    if new_char != new_chars[idx]:
+                        new_chars[idx] = new_char
+                        changed = True
 
-        return ["".join(new_chars)]
+            return ["".join(new_chars)] if changed else []
+        except Exception as e:
+            logger.warning(f"Chinese synonym replacement failed: {e}")
+            return []
 
     @staticmethod
     def _load_chinese_synonyms() -> dict:
@@ -146,13 +172,14 @@ class RandomOpsAugmenter(BaseAugmenter):
     async def augment(self, text: str, label: str, params: dict) -> list[str]:
         words = text.split()
         if len(words) < 2:
-            return [text]
+            return []
 
         n_ops = params.get("n_ops")
         if n_ops is None:
             n_ops = max(1, int(len(words) * 0.1))
 
         results = []
+        seen = set()
         for _ in range(min(n_ops, 4)):
             op = random.choice(["insert", "swap", "delete"])
             new_words = words.copy()
@@ -165,10 +192,12 @@ class RandomOpsAugmenter(BaseAugmenter):
                 delete_prob = params.get("delete_prob", 0.1)
                 new_words = [w for w in new_words if random.random() > delete_prob]
 
-            if new_words:
-                results.append(" ".join(new_words))
+            new_text = " ".join(new_words)
+            if new_text and new_text != text and new_text not in seen:
+                seen.add(new_text)
+                results.append(new_text)
 
-        return results if results else [text]
+        return results
 
     @staticmethod
     def _random_insert(words: list[str]):
@@ -417,6 +446,17 @@ async def execute_augmentation_task(
         if task.strategy == "template_generation":
             strategy_params["sample_pool"] = source_samples_for_template
 
+        for sample in original_samples:
+            new_sample = Sample(
+                version_id=target_version.id,
+                text=sample.text,
+                label=sample.label,
+                split=sample.split,
+                source=SampleSource.original,
+                source_sample_id=sample.id,
+            )
+            session.add(new_sample)
+
         generated_count = 0
         max_total = int(total * task.augmentation_multiplier * MAX_AUGMENTATION_MULTIPLIER)
         max_additional = int(total * task.augmentation_multiplier)
@@ -464,16 +504,13 @@ async def execute_augmentation_task(
                 await asyncio.sleep(0)
 
         class_dist = Counter()
-        for s in original_samples:
-            class_dist[s.label] += 1
-
         stmt_count = select(Sample).where(Sample.version_id == target_version.id)
         count_result = await session.execute(stmt_count)
-        aug_samples = count_result.scalars().all()
-        for s in aug_samples:
+        all_samples = count_result.scalars().all()
+        for s in all_samples:
             class_dist[s.label] += 1
 
-        target_version.total_samples = len(original_samples) + generated_count
+        target_version.total_samples = len(all_samples)
         target_version.class_distribution = dict(class_dist)
         target_version.split_ratios = (
             (await session.execute(select(DatasetVersion).where(DatasetVersion.id == task.source_version_id)))

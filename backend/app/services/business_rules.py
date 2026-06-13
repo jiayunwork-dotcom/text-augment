@@ -4,7 +4,9 @@ from collections import Counter
 from ..config import (
     MAX_AUGMENTATION_MULTIPLIER,
     BACK_TRANSLATION_PAIRS,
+    LANGUAGE_FAMILY_MAP,
     SAME_FAMILY_BLACKLIST,
+    INVALID_PIVOT_SUGGESTIONS,
     MIN_SAMPLES_PER_CLASS,
 )
 from ..models.db_models import Sample, SampleSource, AugmentationTask
@@ -33,36 +35,57 @@ def validate_augmentation_multiplier(
 
 
 def validate_back_translation_pair(source_lang: str, pivot_lang: str) -> dict:
+    if source_lang == pivot_lang:
+        return {
+            "valid": False,
+            "reason": "Source and pivot languages must be different",
+            "suggestion": _suggest_pivot(source_lang),
+        }
+
+    source_family = LANGUAGE_FAMILY_MAP.get(source_lang)
+    pivot_family = LANGUAGE_FAMILY_MAP.get(pivot_lang)
+
+    if source_family is None:
+        return {
+            "valid": True,
+            "warning": f"Source language '{source_lang}' not in language family map. Proceeding without family check.",
+        }
+
+    if pivot_family is None:
+        return {
+            "valid": True,
+            "warning": f"Pivot language '{pivot_lang}' not in language family map. Proceeding without family check.",
+        }
+
+    blacklisted = SAME_FAMILY_BLACKLIST.get(source_family, set())
+    if pivot_family in blacklisted:
+        return {
+            "valid": False,
+            "reason": f"Source language ({source_lang}, family: {source_family}) and pivot language ({pivot_lang}, family: {pivot_family}) "
+                      f"belong to the same or related language families. "
+                      f"Back-translation through the same family would not provide sufficient semantic diversity. "
+                      f"Please choose a pivot from a different language family.",
+            "suggestion": _suggest_pivot(source_lang),
+            "source_family": source_family,
+            "pivot_family": pivot_family,
+        }
+
     for pair_name, pair_info in BACK_TRANSLATION_PAIRS.items():
         if pair_info["source"] == source_lang and pair_info["pivot"] == pivot_lang:
-            source_family = pair_info["source_family"]
-            pivot_family = pair_info["pivot_family"]
-            blacklisted = SAME_FAMILY_BLACKLIST.get(source_family, set())
-            if pivot_family in blacklisted:
-                return {
-                    "valid": False,
-                    "reason": f"Source language ({source_lang}) and pivot language ({pivot_lang}) "
-                              f"belong to the same language family ({source_family}). "
-                              f"Please choose a pivot from a different language family.",
-                    "suggestion": _suggest_pivot(source_lang),
-                }
-            return {"valid": True}
+            return {"valid": True, "predefined": True}
 
     return {
         "valid": True,
         "warning": f"Language pair ({source_lang}-{pivot_lang}) not in predefined pairs. "
-                   f"Proceeding without family check.",
+                   f"Family check passed (source: {source_family}, pivot: {pivot_family}).",
+        "predefined": False,
+        "source_family": source_family,
+        "pivot_family": pivot_family,
     }
 
 
 def _suggest_pivot(source_lang: str) -> str:
-    suggestions = {
-        "en": "fr (Romance) or zh (Sino-Tibetan) or ja (Japonic)",
-        "zh": "en (Germanic) or ja (Japonic)",
-        "de": "fr (Romance) or zh (Sino-Tibetan)",
-        "fr": "en (Germanic) or zh (Sino-Tibetan)",
-    }
-    return suggestions.get(source_lang, "Choose a language from a different language family")
+    return INVALID_PIVOT_SUGGESTIONS.get(source_lang, INVALID_PIVOT_SUGGESTIONS["default"])
 
 
 def validate_split_consistency(
@@ -106,6 +129,62 @@ def check_class_minimum_samples(
             "undersampled_classes": undersampled,
         }
     return {"needs_oversampling": False, "undersampled_classes": {}}
+
+
+async def check_version_filtered(
+    session: AsyncSession,
+    version_id: int,
+    strictness_override: str = None,
+) -> dict:
+    from sqlalchemy import select, or_
+    from ..models.db_models import DatasetVersion, Sample, SampleSource
+
+    stmt = select(DatasetVersion).where(DatasetVersion.id == version_id)
+    result = await session.execute(stmt)
+    version = result.scalar_one_or_none()
+
+    if not version:
+        return {"valid": False, "reason": "Version not found"}
+
+    if version.version_type == "filtered":
+        return {"valid": True, "is_filtered": True, "version_type": version.version_type}
+
+    if version.version_type == "original":
+        return {
+            "valid": False,
+            "is_filtered": False,
+            "reason": "Original data version has not been quality filtered. "
+                     "Quality filtering is mandatory before training. "
+                     "Please run a filter task on this version first.",
+            "required_action": "Run filtering",
+            "version_type": version.version_type,
+        }
+
+    if version.version_type == "augmented":
+        return {
+            "valid": False,
+            "is_filtered": False,
+            "reason": "Augmented data version has not been quality filtered. "
+                     "Quality filtering is mandatory before training. "
+                     "Please run a filter task on this version first.",
+            "required_action": "Run filtering",
+            "version_type": version.version_type,
+        }
+
+    if version.version_type == "unlabeled":
+        return {
+            "valid": True,
+            "is_filtered": False,
+            "is_unlabeled": True,
+            "reason": "Unlabeled version does not require filtering for semi-supervised pseudo-labeling",
+            "version_type": version.version_type,
+        }
+
+    return {
+        "valid": True,
+        "is_filtered": True,
+        "version_type": version.version_type,
+    }
 
 
 def truncate_augmented_samples(

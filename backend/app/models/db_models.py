@@ -51,6 +51,7 @@ class SampleSource(str, enum.Enum):
     template_generation = "template_generation"
     oversampling = "oversampling"
     pseudo_label = "pseudo_label"
+    unlabeled = "unlabeled"
 
 
 class Dataset(Base):
