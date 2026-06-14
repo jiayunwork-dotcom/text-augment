@@ -42,7 +42,7 @@ def api_delete(path: str):
 st.sidebar.title("🧪 Text Augment Platform")
 page = st.sidebar.radio(
     "Navigation",
-    ["📊 Dashboard", "📁 Datasets", "🔧 Augmentation", "🔍 Filtering", "🏋️ Training", "📈 Evaluation"],
+    ["📊 Dashboard", "📁 Datasets", "🔧 Augmentation", "🔍 Filtering", "🏷️ Annotation", "🏋️ Training", "📈 Evaluation"],
 )
 
 if page == "📊 Dashboard":
@@ -513,6 +513,528 @@ elif page == "🔍 Filtering":
         else:
             st.info("No filter tasks yet.")
 
+elif page == "🏷️ Annotation":
+    st.title("🏷️ Active Learning Annotation")
+
+    tab_dashboard, tab_create, tab_annotate, tab_dispute, tab_consistency = st.tabs(
+        ["📊 Dashboard", "➕ Create Queue", "✍️ Annotate", "⚖️ Dispute", "📏 Consistency"]
+    )
+
+    with tab_dashboard:
+        st.subheader("Annotation Dashboard")
+        queues = api_get("/annotation/queues") or []
+
+        if queues:
+            active_queues = [q for q in queues if q.get("status") in ("pending", "in_progress", "completed")]
+            if active_queues:
+                queue_opts = {
+                    f"#{q['id']} {q['name']} ({q['status']}) - {q.get('progress', {}).get('total', 0)} items": q["id"]
+                    for q in active_queues
+                }
+                sel_q = st.selectbox("Select Active Queue", list(queue_opts.keys()), key="dash_queue")
+                if sel_q:
+                    qid = queue_opts[sel_q]
+                    queue_detail = api_get(f"/annotation/queues/{qid}")
+                    if queue_detail:
+                        prog = queue_detail.get("progress", {})
+                        total = prog.get("total", 0)
+                        col1, col2, col3, col4 = st.columns(4)
+                        col1.metric("Total Items", total)
+                        col2.metric("Pending", prog.get("pending", 0))
+                        col3.metric("Annotated", prog.get("annotated", 0) + prog.get("arbitrated", 0))
+                        col4.metric("Disputed", prog.get("disputed", 0))
+
+                        finalized = prog.get("annotated", 0) + prog.get("arbitrated", 0)
+                        confirm = prog.get("confirm_count", 0)
+                        relabel = prog.get("relabel_count", 0)
+                        discard = prog.get("discard_count", 0)
+                        pending = prog.get("pending", 0) + prog.get("locked", 0)
+                        disputed = prog.get("disputed", 0)
+
+                        if total > 0:
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                pie_data = []
+                                pie_labels = []
+                                if confirm > 0:
+                                    pie_data.append(confirm)
+                                    pie_labels.append(f"Confirmed ({confirm})")
+                                if relabel > 0:
+                                    pie_data.append(relabel)
+                                    pie_labels.append(f"Relabeled ({relabel})")
+                                if discard > 0:
+                                    pie_data.append(discard)
+                                    pie_labels.append(f"Discarded ({discard})")
+                                if pending > 0:
+                                    pie_data.append(pending)
+                                    pie_labels.append(f"Pending ({pending})")
+                                if disputed > 0:
+                                    pie_data.append(disputed)
+                                    pie_labels.append(f"Disputed ({disputed})")
+
+                                if pie_data:
+                                    fig = go.Figure(data=[go.Pie(
+                                        labels=pie_labels,
+                                        values=pie_data,
+                                        hole=0.4,
+                                        marker=dict(colors=["#4CAF50", "#FFC107", "#F44336", "#9E9E9E", "#FF5722"])
+                                    )])
+                                    fig.update_layout(title="Annotation Status Distribution")
+                                    st.plotly_chart(fig, use_container_width=True)
+
+                            with c2:
+                                if finalized > 0:
+                                    dec_data = [confirm, relabel, discard]
+                                    dec_labels = [f"Confirm {confirm/finalized:.1%}", f"Relabel {relabel/finalized:.1%}", f"Discard {discard/finalized:.1%}"]
+                                    fig2 = go.Figure(data=[go.Bar(
+                                        x=dec_data,
+                                        y=dec_labels,
+                                        orientation="h",
+                                        marker=dict(color=["#4CAF50", "#FFC107", "#F44336"])
+                                    )])
+                                    fig2.update_layout(title="Decision Distribution (Finalized)")
+                                    st.plotly_chart(fig2, use_container_width=True)
+
+                        st.subheader("Queue Info")
+                        st.json(queue_detail)
+
+                        if queue_detail.get("status") == "completed":
+                            st.success("✅ Queue completed! Ready to apply.")
+                            applied_by = st.text_input("Applied by (your name)", value="admin", key="apply_by")
+                            if st.button("🚀 Apply Annotation Results", type="primary"):
+                                with st.spinner("Applying results to create annotated version..."):
+                                    result = api_post("/annotation/apply", data={
+                                        "queue_id": qid,
+                                        "applied_by": applied_by,
+                                    })
+                                    if "error" in result:
+                                        st.error(f"Failed: {result['error']}")
+                                    else:
+                                        st.success("✅ Applied successfully!")
+                                        st.json(result)
+            else:
+                st.info("No active queues. Create one in the 'Create Queue' tab.")
+        else:
+            st.info("No queues yet. Create one in the 'Create Queue' tab.")
+
+        st.subheader("All Queues")
+        if queues:
+            q_df = pd.DataFrame(queues)
+            disp_cols = ["id", "name", "version_id", "status", "capacity", "review_mode", "num_reviewers", "created_at"]
+            avail = [c for c in disp_cols if c in q_df.columns]
+            st.dataframe(q_df[avail], use_container_width=True)
+
+    with tab_create:
+        st.subheader("Create Annotation Queue")
+        datasets = api_get("/datasets") or []
+        if not datasets:
+            st.warning("No datasets available.")
+        else:
+            all_versions = []
+            for d in datasets:
+                detail = api_get(f"/datasets/{d['id']}")
+                if detail:
+                    for v in detail.get("versions", []):
+                        if v.get("version_type") == "filtered":
+                            all_versions.append({
+                                "id": v["id"],
+                                "name": f"v{v['id']}: {d['name']} / {v['version_name']} ({v.get('total_samples',0)} samples)",
+                            })
+
+            if not all_versions:
+                st.warning("⚠️ No filtered versions available. Please run a quality filter task first.")
+            else:
+                v_opts = {v["name"]: v["id"] for v in all_versions}
+                sel_v = st.selectbox("Select Filtered Version", list(v_opts.keys()), key="create_v")
+                v_id = v_opts[sel_v]
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    q_name = st.text_input("Queue Name", value=f"queue_v{v_id}")
+                    capacity = st.number_input("Capacity (max items)", 1, 10000, 100, 10)
+                    lock_timeout = st.number_input("Lock Timeout (minutes)", 1, 1440, 30, 5)
+
+                with col2:
+                    review_mode = st.radio("Review Mode", ["single", "multi"], horizontal=True)
+                    if review_mode == "multi":
+                        num_reviewers = st.number_input("Number of Reviewers (odd)", 1, 9, 3, 2)
+                        if num_reviewers % 2 == 0:
+                            st.warning("⚠️ Multi-review mode requires odd number of reviewers.")
+                    else:
+                        num_reviewers = 1
+
+                created_by = st.text_input("Created by", value="admin")
+
+                if st.button("✨ Create Annotation Queue", type="primary"):
+                    if review_mode == "multi" and num_reviewers % 2 == 0:
+                        st.error("Number of reviewers must be odd for multi-review mode.")
+                    else:
+                        payload = {
+                            "version_id": v_id,
+                            "name": q_name,
+                            "capacity": capacity,
+                            "review_mode": review_mode,
+                            "num_reviewers": num_reviewers,
+                            "lock_timeout_minutes": lock_timeout,
+                            "created_by": created_by,
+                        }
+                        result = api_post("/annotation/queues", data=payload)
+                        if "error" in result:
+                            st.error(f"Failed: {result['error']}")
+                        else:
+                            st.success(f"✅ Queue created! ID: {result.get('id')}, Items: {result.get('progress', {}).get('total', 0)}")
+                            st.json(result)
+
+    with tab_annotate:
+        st.subheader("Annotation Workspace")
+        queues = api_get("/annotation/queues") or []
+        active = [q for q in queues if q.get("status") in ("pending", "in_progress")]
+
+        if not active:
+            st.info("No active queues for annotation. Create or wait for a queue.")
+        else:
+            annotator_id = st.text_input("👤 Annotator ID", value="annotator_1", key="ann_id")
+
+            q_opts = {f"#{q['id']} {q['name']} ({q['status']})": q["id"] for q in active}
+            sel_q = st.selectbox("Select Queue", list(q_opts.keys()), key="annotate_q")
+            if sel_q:
+                qid = q_opts[sel_q]
+                batch_size = st.number_input("Batch Size", 1, 100, 5, 1, key="batch_size")
+
+                if "current_batch" not in st.session_state:
+                    st.session_state.current_batch = []
+                if "batch_decisions" not in st.session_state:
+                    st.session_state.batch_decisions = {}
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("🎯 Claim Next Batch", type="primary"):
+                        with st.spinner("Claiming tasks..."):
+                            result = api_post("/annotation/claim", data={
+                                "queue_id": qid,
+                                "annotator_id": annotator_id,
+                                "batch_size": batch_size,
+                            })
+                            if isinstance(result, list):
+                                st.session_state.current_batch = result
+                                st.session_state.batch_decisions = {}
+                                if not result:
+                                    st.info("No more tasks available to claim.")
+                            elif isinstance(result, dict) and "error" in result:
+                                st.error(f"Failed: {result['error']}")
+
+                with col2:
+                    if st.button("🔓 Release All Locks"):
+                        item_ids = [s["item_id"] for s in st.session_state.current_batch]
+                        if item_ids:
+                            result = api_post("/annotation/release", data={
+                                "queue_id": qid,
+                                "annotator_id": annotator_id,
+                                "item_ids": item_ids,
+                            })
+                            st.success(f"Released {result.get('released_count', 0)} locks")
+                            st.session_state.current_batch = []
+                            st.session_state.batch_decisions = {}
+                        else:
+                            st.info("No locks to release")
+
+                if st.session_state.current_batch:
+                    st.subheader(f"📝 Annotating Batch ({len(st.session_state.current_batch)} samples)")
+
+                    for idx, sample in enumerate(st.session_state.current_batch):
+                        item_id = sample["item_id"]
+                        with st.container():
+                            st.markdown(f"### Sample {idx + 1} (Item #{item_id})")
+                            unc = sample.get("uncertainty_score", 0)
+                            col_a, col_b, col_c = st.columns(3)
+                            col_a.metric("Uncertainty", f"{unc:.3f}")
+                            col_b.metric("Current Label", sample.get("current_label", "N/A"))
+                            conf = sample.get("confidence")
+                            col_c.metric("Model Confidence", f"{conf:.3f}" if conf else "N/A")
+
+                            if sample.get("similarity_score") is not None:
+                                st.caption(f"Similarity Score: {sample['similarity_score']:.3f} | "
+                                           f"Perplexity: {sample.get('perplexity', 'N/A')}")
+
+                            st.info(f"**Text:** {sample.get('text', '')}")
+
+                            decision_key = f"dec_{item_id}"
+                            label_key = f"lbl_{item_id}"
+                            comment_key = f"cmt_{item_id}"
+
+                            if decision_key not in st.session_state.batch_decisions:
+                                st.session_state.batch_decisions[decision_key] = "confirm"
+
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                decision = st.radio(
+                                    "Decision",
+                                    ["confirm", "relabel", "discard"],
+                                    index=["confirm", "relabel", "discard"].index(
+                                        st.session_state.batch_decisions.get(decision_key, "confirm")
+                                    ),
+                                    key=f"radio_{item_id}",
+                                    horizontal=True,
+                                )
+                                st.session_state.batch_decisions[decision_key] = decision
+
+                            with c2:
+                                if decision == "relabel":
+                                    new_label = st.text_input(
+                                        "New Label",
+                                        value=st.session_state.batch_decisions.get(label_key, ""),
+                                        key=f"input_{item_id}",
+                                    )
+                                    st.session_state.batch_decisions[label_key] = new_label
+
+                            comment = st.text_area(
+                                "Comment (optional)",
+                                key=f"ta_{item_id}",
+                                height=60,
+                            )
+                            st.session_state.batch_decisions[comment_key] = comment
+
+                            st.divider()
+
+                    if st.button("✅ Submit All Decisions", type="primary"):
+                        items_payload = []
+                        has_error = False
+                        for sample in st.session_state.current_batch:
+                            item_id = sample["item_id"]
+                            dec = st.session_state.batch_decisions.get(f"dec_{item_id}", "confirm")
+                            new_lbl = st.session_state.batch_decisions.get(f"lbl_{item_id}", "")
+                            cmt = st.session_state.batch_decisions.get(f"cmt_{item_id}", "")
+
+                            if dec == "relabel" and not new_lbl:
+                                st.error(f"❌ Item #{item_id}: new_label required for relabel decision")
+                                has_error = True
+                                continue
+
+                            item_payload = {
+                                "item_id": item_id,
+                                "decision": dec,
+                                "new_label": new_lbl if dec == "relabel" else None,
+                                "comment": cmt or None,
+                            }
+                            items_payload.append(item_payload)
+
+                        if not has_error and items_payload:
+                            with st.spinner("Submitting annotations..."):
+                                result = api_post("/annotation/submit", data={
+                                    "queue_id": qid,
+                                    "annotator_id": annotator_id,
+                                    "items": items_payload,
+                                })
+                                if "error" in str(result):
+                                    st.error(f"Submission error: {result}")
+                                else:
+                                    processed = result.get("processed_count", 0)
+                                    errors = result.get("errors", [])
+                                    st.success(f"✅ Submitted {processed} items successfully!")
+                                    if errors:
+                                        st.warning(f"⚠️ {len(errors)} errors:")
+                                        for e in errors:
+                                            st.write(e)
+                                    st.session_state.current_batch = []
+                                    st.session_state.batch_decisions = {}
+
+    with tab_dispute:
+        st.subheader("⚖️ Dispute Resolution")
+        queues = api_get("/annotation/queues") or []
+        q_with_any = [q for q in queues if q.get("status") in ("pending", "in_progress", "completed")]
+
+        if not q_with_any:
+            st.info("No queues available.")
+        else:
+            q_opts = {f"#{q['id']} {q['name']}": q["id"] for q in q_with_any}
+            sel_q = st.selectbox("Select Queue", list(q_opts.keys()), key="dispute_q")
+            if sel_q:
+                qid = q_opts[sel_q]
+                arbitrator_id = st.text_input("👨‍⚖️ Arbitrator ID", value="admin", key="arb_id")
+
+                disputed = api_get(f"/annotation/queues/{qid}/disputed") or []
+                if not disputed:
+                    st.success("✅ No disputed items in this queue.")
+                else:
+                    st.warning(f"⚠️ {len(disputed)} disputed item(s) found")
+
+                    if "arb_decisions" not in st.session_state:
+                        st.session_state.arb_decisions = {}
+
+                    for d in disputed:
+                        item_id = d["item_id"]
+                        with st.expander(f"Disputed Item #{item_id} (Uncertainty: {d.get('uncertainty_score', 0):.3f})", expanded=True):
+                            st.write(f"**Sample ID:** {d['sample_id']}")
+                            st.write(f"**Current Label:** {d['current_label']}")
+                            st.info(f"**Text:** {d['text']}")
+
+                            st.subheader("Annotator Records")
+                            records = d.get("records", [])
+                            for r in records:
+                                st.write(f"- **{r['annotator_id']}**: {r['decision']} "
+                                         f"{'→ ' + r['new_label'] if r.get('new_label') else ''} "
+                                         f"({r.get('created_at', '')})")
+                                if r.get("comment"):
+                                    st.caption(f"  Comment: {r['comment']}")
+
+                            st.subheader("Arbitration Decision")
+                            d_key = f"arb_dec_{item_id}"
+                            l_key = f"arb_lbl_{item_id}"
+                            c_key = f"arb_cmt_{item_id}"
+
+                            if d_key not in st.session_state.arb_decisions:
+                                st.session_state.arb_decisions[d_key] = "confirm"
+
+                            dec = st.radio(
+                                "Final Decision",
+                                ["confirm", "relabel", "discard"],
+                                index=["confirm", "relabel", "discard"].index(
+                                    st.session_state.arb_decisions.get(d_key, "confirm")
+                                ),
+                                key=f"arb_radio_{item_id}",
+                                horizontal=True,
+                            )
+                            st.session_state.arb_decisions[d_key] = dec
+
+                            if dec == "relabel":
+                                new_lbl = st.text_input(
+                                    "New Label",
+                                    value=st.session_state.arb_decisions.get(l_key, ""),
+                                    key=f"arb_input_{item_id}",
+                                )
+                                st.session_state.arb_decisions[l_key] = new_lbl
+
+                            cmt = st.text_area("Comment (optional)", key=f"arb_ta_{item_id}", height=60)
+                            st.session_state.arb_decisions[c_key] = cmt
+
+                    if st.button("⚖️ Submit Arbitration", type="primary"):
+                        items_payload = []
+                        has_error = False
+                        for d in disputed:
+                            item_id = d["item_id"]
+                            dec = st.session_state.arb_decisions.get(f"arb_dec_{item_id}", "confirm")
+                            new_lbl = st.session_state.arb_decisions.get(f"arb_lbl_{item_id}", "")
+                            cmt = st.session_state.arb_decisions.get(f"arb_cmt_{item_id}", "")
+
+                            if dec == "relabel" and not new_lbl:
+                                st.error(f"❌ Item #{item_id}: new_label required for relabel")
+                                has_error = True
+                                continue
+
+                            items_payload.append({
+                                "item_id": item_id,
+                                "decision": dec,
+                                "new_label": new_lbl if dec == "relabel" else None,
+                                "comment": cmt or None,
+                            })
+
+                        if not has_error and items_payload:
+                            with st.spinner("Submitting arbitration..."):
+                                result = api_post("/annotation/arbitrate", data={
+                                    "queue_id": qid,
+                                    "arbitrator_id": arbitrator_id,
+                                    "items": items_payload,
+                                })
+                                if "error" in str(result):
+                                    st.error(f"Error: {result}")
+                                else:
+                                    processed = result.get("processed_count", 0)
+                                    errors = result.get("errors", [])
+                                    st.success(f"✅ Arbitrated {processed} items!")
+                                    if errors:
+                                        st.warning(f"⚠️ {len(errors)} errors")
+                                    st.session_state.arb_decisions = {}
+
+    with tab_consistency:
+        st.subheader("📏 Annotation Consistency Report")
+        queues = api_get("/annotation/queues") or []
+        q_with_ann = [q for q in queues if (q.get("progress", {}).get("annotated", 0) + (q.get("progress", {}).get("arbitrated", 0))) > 0]
+
+        if not q_with_ann:
+            st.info("No annotated queues available yet.")
+        else:
+            q_opts = {f"#{q['id']} {q['name']}": q["id"] for q in q_with_ann}
+            sel_q = st.selectbox("Select Queue", list(q_opts.keys()), key="cons_q")
+            if sel_q and st.button("📊 Generate Report", type="primary"):
+                qid = q_opts[sel_q]
+                report = api_get(f"/annotation/queues/{qid}/consistency")
+
+                if report:
+                    kappa = report.get("cohens_kappa", 0.0)
+                    level = report.get("kappa_level", "")
+
+                    if report.get("warning"):
+                        st.warning(f"⚠️ {report['warning']}")
+
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Cohen's Kappa", f"{kappa:.4f}")
+                    level_labels = {
+                        "excellent": ("🌟 Excellent", "#4CAF50"),
+                        "good": ("✅ Good", "#2196F3"),
+                        "needs_attention": ("⚠️ Needs Attention", "#FF9800"),
+                    }
+                    label_text, color = level_labels.get(level, ("Unknown", "#9E9E9E"))
+                    col2.markdown(f"<h3 style='color: {color};'>{label_text}</h3>", unsafe_allow_html=True)
+                    col3.metric("Kappa Threshold", "≥ 0.6")
+
+                    st.write("**Kappa Level Guide:**")
+                    st.write("- 🟢 ≥ 0.8: Excellent agreement")
+                    st.write("- 🔵 0.6 ~ 0.8: Good agreement")
+                    st.write("- 🟠 < 0.6: Needs attention / improvement")
+
+                    level_order = ["excellent", "good", "needs_attention"]
+                    level_colors = ["#4CAF50", "#2196F3", "#FF9800"]
+                    kappa_bar_fig = go.Figure(go.Indicator(
+                        mode="gauge+number+delta",
+                        value=kappa,
+                        domain={'x': [0, 1], 'y': [0, 1]},
+                        title={'text': "Cohen's Kappa"},
+                        delta={'reference': 0.6},
+                        gauge={
+                            'axis': {'range': [0, 1]},
+                            'bar': {'color': level_colors[level_order.index(level)] if level in level_order else "#9E9E9E"},
+                            'steps': [
+                                {'range': [0, 0.6], 'color': '#FFEBEE'},
+                                {'range': [0.6, 0.8], 'color': '#E3F2FD'},
+                                {'range': [0.8, 1.0], 'color': '#E8F5E9'},
+                            ],
+                            'threshold': {
+                                'line': {'color': '#F44336', 'width': 4},
+                                'thickness': 0.75,
+                                'value': 0.6,
+                            },
+                        },
+                    ))
+                    st.plotly_chart(kappa_bar_fig, use_container_width=True)
+
+                    pairwise = report.get("pairwise_kappa", {})
+                    if pairwise:
+                        st.subheader("👥 Pairwise Kappa (Between Annotators)")
+                        pw_df = pd.DataFrame(
+                            [(k.replace("_vs_", " ↔ "), v) for k, v in pairwise.items()],
+                            columns=["Annotator Pair", "Cohen's Kappa"]
+                        )
+                        st.dataframe(pw_df, use_container_width=True)
+
+                    ann_stats = report.get("annotator_stats", [])
+                    if ann_stats:
+                        st.subheader("📋 Annotator Statistics")
+                        as_df = pd.DataFrame(ann_stats)
+                        st.dataframe(as_df, use_container_width=True)
+
+                        stats_fig = go.Figure()
+                        for s in ann_stats:
+                            stats_fig.add_trace(go.Bar(
+                                name=s["annotator_id"],
+                                x=["Confirm", "Relabel", "Discard"],
+                                y=[s["confirm_count"], s["relabel_count"], s["discard_count"]],
+                            ))
+                        stats_fig.update_layout(
+                            title="Annotator Decisions by Annotator",
+                            barmode="group",
+                        )
+                        st.plotly_chart(stats_fig, use_container_width=True)
+
 elif page == "🏋️ Training":
     st.title("🏋️ Training Pipeline")
 
@@ -532,7 +1054,14 @@ elif page == "🏋️ Training":
                     for v in detail.get("versions", []):
                         if v.get("version_type") != "unlabeled":
                             vtype = v.get("version_type", "original")
-                            status_icon = "✅" if vtype == "filtered" else "⚠️" if vtype == "augmented" else "⚠️"
+                            if vtype == "filtered":
+                                status_icon = "✅"
+                            elif vtype == "annotated":
+                                status_icon = "🏷️"
+                            elif vtype == "augmented":
+                                status_icon = "⚠️"
+                            else:
+                                status_icon = "⚠️"
                             all_versions.append({
                                 "id": v["id"],
                                 "dataset_id": d["id"],
@@ -543,13 +1072,13 @@ elif page == "🏋️ Training":
             exp_name = st.text_input("Experiment Name", value="experiment_1")
 
             if all_versions:
-                filtered_only = [v for v in all_versions if v["version_type"] == "filtered"]
-                non_filtered = [v for v in all_versions if v["version_type"] != "filtered"]
+                filtered_only = [v for v in all_versions if v["version_type"] in ("filtered", "annotated")]
+                non_filtered = [v for v in all_versions if v["version_type"] not in ("filtered", "annotated")]
 
                 if filtered_only:
-                    st.success(f"✅ {len(filtered_only)} filtered version(s) available for training")
+                    st.success(f"✅ {len(filtered_only)} filtered/annotated version(s) available for training")
                 if non_filtered:
-                    st.warning(f"⚠️ {len(non_filtered)} version(s) not yet filtered - cannot be used for training")
+                    st.warning(f"⚠️ {len(non_filtered)} version(s) not yet filtered/annotated - cannot be used for training")
 
                 v_opts = {v["name"]: v["id"] for v in all_versions}
                 sel_v = st.selectbox("Dataset Version", list(v_opts.keys()))
@@ -557,9 +1086,9 @@ elif page == "🏋️ Training":
                 sel_version = next(v for v in all_versions if v["id"] == v_id)
                 sel_ds_id = next(v["dataset_id"] for v in all_versions if v["id"] == v_id)
 
-                if sel_version["version_type"] != "filtered":
+                if sel_version["version_type"] not in ("filtered", "annotated"):
                     st.error(f"❌ Selected version is of type '{sel_version['version_type']}'. "
-                             "Only 'filtered' versions can be used for training. "
+                             "Only 'filtered' or 'annotated' versions can be used for training. "
                              "Please run a quality filter task on this version first.")
 
                 training_mode = st.selectbox(

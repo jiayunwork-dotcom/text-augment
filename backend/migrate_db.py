@@ -3,7 +3,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from sqlalchemy import create_engine, text, inspect, MetaData, Table, Column, Integer, String, JSON, Boolean, ForeignKey
+from sqlalchemy import create_engine, text, inspect, MetaData, Table, Column, Integer, String, JSON, Boolean, ForeignKey, DateTime, Float, Enum, Text, UniqueConstraint
 from sqlalchemy.schema import CreateTable
 from app.config import DATABASE_URL
 
@@ -56,6 +56,75 @@ def main():
                     print(f"  Column {col_name} added.")
                 else:
                     print(f"  Column {col_name} already exists.")
+
+        if "annotation_queues" not in existing_tables:
+            print("Creating annotation_queues table...")
+            conn.execute(text("""
+                CREATE TABLE annotation_queues (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    version_id INTEGER NOT NULL,
+                    name VARCHAR(255) NOT NULL,
+                    status VARCHAR(20) DEFAULT 'pending',
+                    capacity INTEGER DEFAULT 100,
+                    review_mode VARCHAR(20) DEFAULT 'single',
+                    num_reviewers INTEGER DEFAULT 1,
+                    lock_timeout_minutes INTEGER DEFAULT 30,
+                    created_by VARCHAR(100),
+                    created_at DATETIME,
+                    started_at DATETIME,
+                    completed_at DATETIME,
+                    applied_at DATETIME,
+                    target_version_id INTEGER,
+                    FOREIGN KEY (version_id) REFERENCES dataset_versions(id) ON DELETE CASCADE,
+                    FOREIGN KEY (target_version_id) REFERENCES dataset_versions(id)
+                )
+            """))
+            print("  annotation_queues table created.")
+        else:
+            print("  annotation_queues table already exists.")
+
+        if "annotation_items" not in existing_tables:
+            print("Creating annotation_items table...")
+            conn.execute(text("""
+                CREATE TABLE annotation_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    queue_id INTEGER NOT NULL,
+                    sample_id INTEGER NOT NULL,
+                    uncertainty_score FLOAT DEFAULT 0.0,
+                    status VARCHAR(20) DEFAULT 'pending',
+                    locked_by VARCHAR(100),
+                    locked_at DATETIME,
+                    final_decision VARCHAR(20),
+                    final_label VARCHAR(100),
+                    arbitrated_by VARCHAR(100),
+                    arbitrated_at DATETIME,
+                    FOREIGN KEY (queue_id) REFERENCES annotation_queues(id) ON DELETE CASCADE,
+                    FOREIGN KEY (sample_id) REFERENCES samples(id) ON DELETE CASCADE,
+                    UNIQUE (queue_id, sample_id)
+                )
+            """))
+            print("  annotation_items table created.")
+        else:
+            print("  annotation_items table already exists.")
+
+        if "annotation_records" not in existing_tables:
+            print("Creating annotation_records table...")
+            conn.execute(text("""
+                CREATE TABLE annotation_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL,
+                    annotator_id VARCHAR(100) NOT NULL,
+                    decision VARCHAR(20) NOT NULL,
+                    new_label VARCHAR(100),
+                    comment TEXT,
+                    created_at DATETIME,
+                    FOREIGN KEY (item_id) REFERENCES annotation_items(id) ON DELETE CASCADE,
+                    UNIQUE (item_id, annotator_id)
+                )
+            """))
+            print("  annotation_records table created.")
+        else:
+            print("  annotation_records table already exists.")
 
     print("Migration completed successfully!")
 

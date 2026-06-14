@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .database import init_db
-from .routers import datasets, augmentation, filtering, training, evaluation
+from .routers import datasets, augmentation, filtering, training, evaluation, annotation
 from .config import LOG_LEVEL
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
@@ -41,6 +41,7 @@ app.include_router(augmentation.router, prefix="/api/v1")
 app.include_router(filtering.router, prefix="/api/v1")
 app.include_router(training.router, prefix="/api/v1")
 app.include_router(evaluation.router, prefix="/api/v1")
+app.include_router(annotation.router, prefix="/api/v1")
 
 
 @app.get("/")

@@ -180,6 +180,15 @@ async def check_version_filtered(
             "version_type": version.version_type,
         }
 
+    if version.version_type == "annotated":
+        return {
+            "valid": True,
+            "is_filtered": True,
+            "is_annotated": True,
+            "reason": "Annotated version has been manually reviewed, ready for training",
+            "version_type": version.version_type,
+        }
+
     return {
         "valid": True,
         "is_filtered": True,

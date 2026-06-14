@@ -2,7 +2,7 @@ import enum
 from datetime import datetime
 from sqlalchemy import (
     Column, Integer, String, Text, Float, DateTime, Enum, ForeignKey,
-    JSON, Boolean, Index
+    JSON, Boolean, Index, UniqueConstraint
 )
 from sqlalchemy.orm import relationship
 from ..database import Base
@@ -226,3 +226,89 @@ class ComparisonStudy(Base):
     results = Column(JSON, default=dict)
     significance_tests = Column(JSON, default=dict)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class QueueStatus(str, enum.Enum):
+    pending = "pending"
+    in_progress = "in_progress"
+    completed = "completed"
+    applied = "applied"
+    closed = "closed"
+
+
+class AnnotationDecision(str, enum.Enum):
+    confirm = "confirm"
+    relabel = "relabel"
+    discard = "discard"
+
+
+class AnnotationStatus(str, enum.Enum):
+    pending = "pending"
+    locked = "locked"
+    annotated = "annotated"
+    disputed = "disputed"
+    arbitrated = "arbitrated"
+
+
+class AnnotationQueue(Base):
+    __tablename__ = "annotation_queues"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    version_id = Column(Integer, ForeignKey("dataset_versions.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(255), nullable=False)
+    status = Column(Enum(QueueStatus), default=QueueStatus.pending)
+    capacity = Column(Integer, default=100)
+    review_mode = Column(String(20), default="single")
+    num_reviewers = Column(Integer, default=1)
+    lock_timeout_minutes = Column(Integer, default=30)
+    created_by = Column(String(100), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    applied_at = Column(DateTime, nullable=True)
+    target_version_id = Column(Integer, ForeignKey("dataset_versions.id"), nullable=True)
+
+    version = relationship("DatasetVersion", foreign_keys=[version_id])
+    items = relationship("AnnotationItem", back_populates="queue", cascade="all, delete-orphan")
+
+
+class AnnotationItem(Base):
+    __tablename__ = "annotation_items"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    queue_id = Column(Integer, ForeignKey("annotation_queues.id", ondelete="CASCADE"), nullable=False)
+    sample_id = Column(Integer, ForeignKey("samples.id", ondelete="CASCADE"), nullable=False)
+    uncertainty_score = Column(Float, default=0.0)
+    status = Column(Enum(AnnotationStatus), default=AnnotationStatus.pending)
+    locked_by = Column(String(100), nullable=True)
+    locked_at = Column(DateTime, nullable=True)
+    final_decision = Column(Enum(AnnotationDecision), nullable=True)
+    final_label = Column(String(100), nullable=True)
+    arbitrated_by = Column(String(100), nullable=True)
+    arbitrated_at = Column(DateTime, nullable=True)
+
+    queue = relationship("AnnotationQueue", back_populates="items")
+    sample = relationship("Sample")
+    records = relationship("AnnotationRecord", back_populates="item", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        UniqueConstraint("queue_id", "sample_id", name="uq_queue_sample"),
+    )
+
+
+class AnnotationRecord(Base):
+    __tablename__ = "annotation_records"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    item_id = Column(Integer, ForeignKey("annotation_items.id", ondelete="CASCADE"), nullable=False)
+    annotator_id = Column(String(100), nullable=False)
+    decision = Column(Enum(AnnotationDecision), nullable=False)
+    new_label = Column(String(100), nullable=True)
+    comment = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    item = relationship("AnnotationItem", back_populates="records")
+
+    __table_args__ = (
+        UniqueConstraint("item_id", "annotator_id", name="uq_item_annotator"),
+    )

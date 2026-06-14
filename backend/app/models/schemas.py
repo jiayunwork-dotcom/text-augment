@@ -380,3 +380,153 @@ class SampleApprovalRequest(BaseModel):
 
 class TaskActionRequest(BaseModel):
     action: str
+
+
+class QueueStatus(str, Enum):
+    pending = "pending"
+    in_progress = "in_progress"
+    completed = "completed"
+    applied = "applied"
+    closed = "closed"
+
+
+class AnnotationDecision(str, Enum):
+    confirm = "confirm"
+    relabel = "relabel"
+    discard = "discard"
+
+
+class AnnotationStatus(str, Enum):
+    pending = "pending"
+    locked = "locked"
+    annotated = "annotated"
+    disputed = "disputed"
+    arbitrated = "arbitrated"
+
+
+class AnnotationQueueCreate(BaseModel):
+    version_id: int
+    name: str = ""
+    capacity: int = Field(default=100, ge=1, le=10000)
+    review_mode: str = Field(default="single", pattern="^(single|multi)$")
+    num_reviewers: int = Field(default=1, ge=1, le=9)
+    lock_timeout_minutes: int = Field(default=30, ge=1, le=1440)
+    created_by: str = ""
+
+
+class QueueProgressStats(BaseModel):
+    total: int = 0
+    pending: int = 0
+    locked: int = 0
+    annotated: int = 0
+    disputed: int = 0
+    arbitrated: int = 0
+    confirm_count: int = 0
+    relabel_count: int = 0
+    discard_count: int = 0
+    confirm_rate: float = 0.0
+    relabel_rate: float = 0.0
+    discard_rate: float = 0.0
+
+
+class AnnotationQueueResponse(BaseModel):
+    id: int
+    version_id: int
+    name: str
+    status: QueueStatus
+    capacity: int
+    review_mode: str
+    num_reviewers: int
+    lock_timeout_minutes: int
+    created_by: Optional[str] = None
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    applied_at: Optional[datetime] = None
+    target_version_id: Optional[int] = None
+    progress: Optional[QueueProgressStats] = None
+
+    class Config:
+        from_attributes = True
+
+
+class AnnotationSampleResponse(BaseModel):
+    item_id: int
+    sample_id: int
+    text: str
+    current_label: str
+    predicted_label: Optional[str] = None
+    confidence: Optional[float] = None
+    similarity_score: Optional[float] = None
+    perplexity: Optional[float] = None
+    uncertainty_score: float
+    source_sample_id: Optional[int] = None
+
+
+class ClaimTasksRequest(BaseModel):
+    queue_id: int
+    annotator_id: str
+    batch_size: int = Field(default=10, ge=1, le=100)
+
+
+class AnnotationSubmitItem(BaseModel):
+    item_id: int
+    decision: AnnotationDecision
+    new_label: Optional[str] = None
+    comment: Optional[str] = None
+
+
+class SubmitAnnotationsRequest(BaseModel):
+    queue_id: int
+    annotator_id: str
+    items: list[AnnotationSubmitItem]
+
+
+class ReleaseLocksRequest(BaseModel):
+    queue_id: int
+    annotator_id: str
+    item_ids: list[int] = []
+
+
+class ArbitrateItem(BaseModel):
+    item_id: int
+    decision: AnnotationDecision
+    new_label: Optional[str] = None
+    comment: Optional[str] = None
+
+
+class ArbitrateRequest(BaseModel):
+    queue_id: int
+    arbitrator_id: str
+    items: list[ArbitrateItem]
+
+
+class DisputedItemResponse(BaseModel):
+    item_id: int
+    sample_id: int
+    text: str
+    current_label: str
+    records: list[dict]
+    uncertainty_score: float
+
+
+class ApplyQueueRequest(BaseModel):
+    queue_id: int
+    applied_by: str = ""
+
+
+class AnnotatorStats(BaseModel):
+    annotator_id: str
+    total_annotated: int = 0
+    confirm_count: int = 0
+    relabel_count: int = 0
+    discard_count: int = 0
+
+
+class ConsistencyReport(BaseModel):
+    queue_id: int
+    cohens_kappa: float = 0.0
+    kappa_level: str = ""
+    warning: Optional[str] = None
+    annotator_stats: list[AnnotatorStats] = []
+    pairwise_kappa: Optional[dict] = None
