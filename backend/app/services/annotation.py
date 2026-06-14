@@ -115,8 +115,11 @@ async def select_uncertain_samples(
     session: AsyncSession,
     version_id: int,
     capacity: int,
+    only_filtered: bool = False,
 ) -> list[tuple[Sample, float]]:
     stmt = select(Sample).where(Sample.version_id == version_id)
+    if only_filtered:
+        stmt = stmt.where(Sample.is_filtered == True)
     result = await session.execute(stmt)
     all_samples = result.scalars().all()
 
@@ -132,7 +135,7 @@ async def select_uncertain_samples(
 async def create_annotation_queue(
     session: AsyncSession,
     request: AnnotationQueueCreate,
-) -> AnnotationQueue:
+) -> tuple[AnnotationQueue, Optional[str]]:
     validation = await check_version_for_annotation(session, request.version_id)
     if not validation["valid"]:
         raise ValueError(validation["reason"])
@@ -170,7 +173,24 @@ async def create_annotation_queue(
     session.add(queue)
     await session.flush()
 
-    selected = await select_uncertain_samples(session, request.version_id, request.capacity)
+    parent_version_id = version.parent_version_id
+    warning = None
+
+    if parent_version_id:
+        selected = await select_uncertain_samples(
+            session, parent_version_id, request.capacity, only_filtered=True
+        )
+    else:
+        selected = []
+        warning = "No parent version found. Cannot select filtered samples for annotation."
+
+    actual_count = len(selected)
+    if actual_count < request.capacity:
+        warning = (
+            f"Requested capacity {request.capacity}, but only {actual_count} "
+            f"filtered samples are available for review. "
+            f"Queue capacity has been adjusted to {actual_count}."
+        )
 
     for sample, score in selected:
         item = AnnotationItem(
@@ -181,15 +201,15 @@ async def create_annotation_queue(
         )
         session.add(item)
 
-    queue.capacity = len(selected)
-    if len(selected) == 0:
+    queue.capacity = actual_count
+    if actual_count == 0:
         queue.status = QueueStatus.completed
         queue.completed_at = datetime.utcnow()
 
     await session.commit()
     await session.refresh(queue)
 
-    return queue
+    return queue, warning
 
 
 async def _get_annotated_class_distribution(
@@ -894,46 +914,48 @@ async def apply_queue_results(
     kept_count = 0
 
     for sample in all_samples:
-        if sample.id in annotated_samples:
-            item, _ = annotated_samples[sample.id]
+        new_sample = Sample(
+            version_id=new_version.id,
+            text=sample.text,
+            label=sample.label,
+            split=sample.split,
+            source=sample.source,
+            source_sample_id=sample.source_sample_id,
+            perplexity=sample.perplexity,
+            similarity_score=sample.similarity_score,
+            label_confidence=sample.label_confidence,
+        )
+        session.add(new_sample)
+        class_dist[sample.label] += 1
+        kept_count += 1
 
-            if item.final_decision == AnnotationDecision.discard:
-                continue
+    restored_count = 0
+    for item, sample in annotated_rows:
+        if item.final_decision == AnnotationDecision.discard:
+            continue
 
-            new_label = sample.label
-            if item.final_decision == AnnotationDecision.relabel and item.final_label:
-                new_label = item.final_label
+        new_label = sample.label
+        if item.final_decision == AnnotationDecision.relabel and item.final_label:
+            new_label = item.final_label
 
-            new_sample = Sample(
-                version_id=new_version.id,
-                text=sample.text,
-                label=new_label,
-                split=sample.split,
-                source=sample.source,
-                source_sample_id=sample.source_sample_id,
-                perplexity=sample.perplexity,
-                similarity_score=sample.similarity_score,
-                label_confidence=sample.label_confidence,
-                is_manually_approved=True,
-            )
-            session.add(new_sample)
-            class_dist[new_label] += 1
-            kept_count += 1
-        else:
-            new_sample = Sample(
-                version_id=new_version.id,
-                text=sample.text,
-                label=sample.label,
-                split=sample.split,
-                source=sample.source,
-                source_sample_id=sample.source_sample_id,
-                perplexity=sample.perplexity,
-                similarity_score=sample.similarity_score,
-                label_confidence=sample.label_confidence,
-            )
-            session.add(new_sample)
-            class_dist[sample.label] += 1
-            kept_count += 1
+        new_sample = Sample(
+            version_id=new_version.id,
+            text=sample.text,
+            label=new_label,
+            split=sample.split,
+            source=sample.source,
+            source_sample_id=sample.source_sample_id,
+            perplexity=sample.perplexity,
+            similarity_score=sample.similarity_score,
+            label_confidence=sample.label_confidence,
+            is_manually_approved=True,
+        )
+        session.add(new_sample)
+        class_dist[new_label] += 1
+        kept_count += 1
+        restored_count += 1
+
+    logger.info(f"[ApplyQueue] Restored {restored_count} filtered samples out of {len(annotated_rows)} annotated")
 
     new_version.total_samples = kept_count
     new_version.class_distribution = dict(class_dist)
@@ -965,26 +987,6 @@ async def _analyze_filter_reason_stats(
 ) -> dict[str, dict]:
     logger.info(f"[FilterStats] Starting analysis for queue {queue_id}")
 
-    queue_stmt = select(AnnotationQueue).where(AnnotationQueue.id == queue_id)
-    queue_result = await session.execute(queue_stmt)
-    queue = queue_result.scalar_one_or_none()
-    if not queue:
-        logger.warning(f"[FilterStats] Queue {queue_id} not found")
-        return {}
-
-    source_version_stmt = select(DatasetVersion).where(
-        DatasetVersion.id == queue.version_id
-    )
-    source_version_result = await session.execute(source_version_stmt)
-    source_version = source_version_result.scalar_one_or_none()
-
-    if not source_version:
-        logger.warning(f"[FilterStats] Source version {queue.version_id} not found")
-        return {}
-
-    logger.info(f"[FilterStats] Source version: type={source_version.version_type}, "
-                f"parent_id={source_version.parent_version_id}")
-
     finalized_stmt = (
         select(AnnotationItem, Sample)
         .join(Sample, AnnotationItem.sample_id == Sample.id)
@@ -995,45 +997,60 @@ async def _analyze_filter_reason_stats(
                     AnnotationStatus.annotated,
                     AnnotationStatus.arbitrated,
                 ]),
+                Sample.filter_reason.isnot(None),
             )
         )
     )
     finalized_result = await session.execute(finalized_stmt)
     finalized_items = finalized_result.all()
 
-    logger.info(f"[FilterStats] Found {len(finalized_items)} finalized annotated items")
+    logger.info(f"[FilterStats] Found {len(finalized_items)} finalized annotated items with filter_reason")
 
     if not finalized_items:
+        logger.info("[FilterStats] No annotated items with filter_reason found")
         return {}
 
-    stats = await _analyze_filter_reason_from_samples(
-        session, finalized_items, source_version
-    )
+    filter_reason_counts = defaultdict(lambda: {
+        "total": 0, "confirm_count": 0, "discard_count": 0, "relabel_count": 0
+    })
 
-    if stats:
-        logger.info(f"[FilterStats] Got {len(stats)} filter reasons from direct analysis")
-        return stats
+    for item, sample in finalized_items:
+        reason = sample.filter_reason
+        if not reason:
+            continue
 
-    logger.info(f"[FilterStats] No filter reasons from direct analysis, trying parent version...")
+        filter_reason_counts[reason]["total"] += 1
+        if item.final_decision == AnnotationDecision.confirm:
+            filter_reason_counts[reason]["confirm_count"] += 1
+        elif item.final_decision == AnnotationDecision.discard:
+            filter_reason_counts[reason]["discard_count"] += 1
+        elif item.final_decision == AnnotationDecision.relabel:
+            filter_reason_counts[reason]["relabel_count"] += 1
 
-    if source_version.parent_version_id:
-        parent_stmt = select(DatasetVersion).where(
-            DatasetVersion.id == source_version.parent_version_id
-        )
-        parent_result = await session.execute(parent_stmt)
-        parent_version = parent_result.scalar_one_or_none()
-        if parent_version:
-            logger.info(f"[FilterStats] Parent version: id={parent_version.id}, "
-                        f"type={parent_version.version_type}")
-            stats = await _analyze_filter_reason_from_parent(
-                session, finalized_items, source_version, parent_version
-            )
-            if stats:
-                logger.info(f"[FilterStats] Got {len(stats)} filter reasons from parent version")
-                return stats
+    stats = {}
+    for reason, counts in filter_reason_counts.items():
+        total = counts["total"]
+        if total == 0:
+            continue
+        confirm_rate = counts["confirm_count"] / total
+        discard_rate = counts["discard_count"] / total
+        relabel_rate = counts["relabel_count"] / total
+        stats[reason] = {
+            "total": total,
+            "confirm_count": counts["confirm_count"],
+            "discard_count": counts["discard_count"],
+            "relabel_count": counts["relabel_count"],
+            "confirm_rate": round(confirm_rate, 4),
+            "discard_rate": round(discard_rate, 4),
+            "relabel_rate": round(relabel_rate, 4),
+        }
 
-    logger.info(f"[FilterStats] Could not find any filter reason data")
-    return {}
+    logger.info(f"[FilterStats] Computed stats for {len(stats)} filter reasons")
+    for reason, s in stats.items():
+        logger.info(f"[FilterStats]   {reason}: total={s['total']}, "
+                    f"confirm_rate={s['confirm_rate']}, discard_rate={s['discard_rate']}")
+
+    return stats
 
 
 async def _analyze_filter_reason_from_samples(

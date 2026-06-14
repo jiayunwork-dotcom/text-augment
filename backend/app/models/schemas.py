@@ -444,6 +444,7 @@ class AnnotationQueueResponse(BaseModel):
     name: str
     status: QueueStatus
     capacity: int
+    requested_capacity: Optional[int] = None
     review_mode: str
     num_reviewers: int
     lock_timeout_minutes: int
@@ -458,6 +459,7 @@ class AnnotationQueueResponse(BaseModel):
     webhook_thresholds: list = []
     triggered_thresholds: list = []
     progress: Optional[QueueProgressStats] = None
+    warning: Optional[str] = None
 
     class Config:
         from_attributes = True

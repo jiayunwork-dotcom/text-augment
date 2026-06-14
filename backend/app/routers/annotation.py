@@ -43,13 +43,15 @@ async def create_queue(
     session: AsyncSession = Depends(get_session),
 ):
     try:
-        queue = await annotation_service.create_annotation_queue(session, request)
+        queue, warning = await annotation_service.create_annotation_queue(session, request)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
     progress = await annotation_service.get_queue_progress(session, queue.id)
     response = AnnotationQueueResponse.model_validate(queue)
     response.progress = progress
+    response.requested_capacity = request.capacity
+    response.warning = warning
     return response
 
 
