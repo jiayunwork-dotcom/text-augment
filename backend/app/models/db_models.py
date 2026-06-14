@@ -236,6 +236,12 @@ class QueueStatus(str, enum.Enum):
     closed = "closed"
 
 
+class PriorityStrategy(str, enum.Enum):
+    uncertainty = "uncertainty"
+    class_balance = "class_balance"
+    hybrid = "hybrid"
+
+
 class AnnotationDecision(str, enum.Enum):
     confirm = "confirm"
     relabel = "relabel"
@@ -267,9 +273,14 @@ class AnnotationQueue(Base):
     completed_at = Column(DateTime, nullable=True)
     applied_at = Column(DateTime, nullable=True)
     target_version_id = Column(Integer, ForeignKey("dataset_versions.id"), nullable=True)
+    priority_strategy = Column(Enum(PriorityStrategy), default=PriorityStrategy.uncertainty)
+    webhook_url = Column(String(500), nullable=True)
+    webhook_thresholds = Column(JSON, default=list)
+    triggered_thresholds = Column(JSON, default=list)
 
     version = relationship("DatasetVersion", foreign_keys=[version_id])
     items = relationship("AnnotationItem", back_populates="queue", cascade="all, delete-orphan")
+    webhook_logs = relationship("WebhookLog", back_populates="queue", cascade="all, delete-orphan")
 
 
 class AnnotationItem(Base):
@@ -306,9 +317,47 @@ class AnnotationRecord(Base):
     new_label = Column(String(100), nullable=True)
     comment = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    locked_at = Column(DateTime, nullable=True)
+    submitted_at = Column(DateTime, nullable=True)
+    annotation_duration_seconds = Column(Float, nullable=True)
+    is_final_decision = Column(Boolean, default=False)
 
     item = relationship("AnnotationItem", back_populates="records")
 
     __table_args__ = (
         UniqueConstraint("item_id", "annotator_id", name="uq_item_annotator"),
     )
+
+
+class WebhookLog(Base):
+    __tablename__ = "webhook_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    queue_id = Column(Integer, ForeignKey("annotation_queues.id", ondelete="CASCADE"), nullable=False)
+    threshold = Column(Float, nullable=False)
+    url = Column(String(500), nullable=False)
+    status_code = Column(Integer, nullable=True)
+    success = Column(Boolean, default=False)
+    response_body = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    queue = relationship("AnnotationQueue", back_populates="webhook_logs")
+
+
+class RecommendedFilterConfig(Base):
+    __tablename__ = "recommended_filter_configs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    version_id = Column(Integer, ForeignKey("dataset_versions.id", ondelete="CASCADE"), nullable=False)
+    queue_id = Column(Integer, ForeignKey("annotation_queues.id"), nullable=True)
+    source_config_name = Column(String(50), default="standard")
+    ppl_multiplier = Column(Float, nullable=True)
+    similarity_threshold = Column(Float, nullable=True)
+    jaccard_threshold = Column(Float, nullable=True)
+    label_confidence_threshold = Column(Float, nullable=True)
+    adjustments = Column(JSON, default=dict)
+    reasoning = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    version = relationship("DatasetVersion")

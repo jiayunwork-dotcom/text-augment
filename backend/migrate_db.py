@@ -126,6 +126,87 @@ def main():
         else:
             print("  annotation_records table already exists.")
 
+        if "annotation_queues" in existing_tables:
+            columns = [col["name"] for col in inspector.get_columns("annotation_queues")]
+            print(f"Existing columns in annotation_queues: {columns}")
+
+            new_columns = [
+                ("priority_strategy", "VARCHAR(20) DEFAULT 'uncertainty'"),
+                ("webhook_url", "VARCHAR(500)"),
+                ("webhook_thresholds", "TEXT DEFAULT '[]'"),
+                ("triggered_thresholds", "TEXT DEFAULT '[]'"),
+            ]
+
+            for col_name, col_def in new_columns:
+                if col_name not in columns:
+                    print(f"Adding column {col_name}...")
+                    conn.execute(text(f"ALTER TABLE annotation_queues ADD COLUMN {col_name} {col_def}"))
+                    print(f"  Column {col_name} added.")
+                else:
+                    print(f"  Column {col_name} already exists.")
+
+        if "annotation_records" in existing_tables:
+            columns = [col["name"] for col in inspector.get_columns("annotation_records")]
+            print(f"Existing columns in annotation_records: {columns}")
+
+            new_columns = [
+                ("locked_at", "DATETIME"),
+                ("submitted_at", "DATETIME"),
+                ("annotation_duration_seconds", "FLOAT"),
+                ("is_final_decision", "BOOLEAN DEFAULT 0"),
+            ]
+
+            for col_name, col_def in new_columns:
+                if col_name not in columns:
+                    print(f"Adding column {col_name}...")
+                    conn.execute(text(f"ALTER TABLE annotation_records ADD COLUMN {col_name} {col_def}"))
+                    print(f"  Column {col_name} added.")
+                else:
+                    print(f"  Column {col_name} already exists.")
+
+        if "webhook_logs" not in existing_tables:
+            print("Creating webhook_logs table...")
+            conn.execute(text("""
+                CREATE TABLE webhook_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    queue_id INTEGER NOT NULL,
+                    threshold FLOAT NOT NULL,
+                    url VARCHAR(500) NOT NULL,
+                    status_code INTEGER,
+                    success BOOLEAN DEFAULT 0,
+                    response_body TEXT,
+                    error_message TEXT,
+                    created_at DATETIME,
+                    FOREIGN KEY (queue_id) REFERENCES annotation_queues(id) ON DELETE CASCADE
+                )
+            """))
+            print("  webhook_logs table created.")
+        else:
+            print("  webhook_logs table already exists.")
+
+        if "recommended_filter_configs" not in existing_tables:
+            print("Creating recommended_filter_configs table...")
+            conn.execute(text("""
+                CREATE TABLE recommended_filter_configs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    version_id INTEGER NOT NULL,
+                    queue_id INTEGER,
+                    source_config_name VARCHAR(50) DEFAULT 'standard',
+                    ppl_multiplier FLOAT,
+                    similarity_threshold FLOAT,
+                    jaccard_threshold FLOAT,
+                    label_confidence_threshold FLOAT,
+                    adjustments TEXT DEFAULT '{}',
+                    reasoning TEXT,
+                    created_at DATETIME,
+                    FOREIGN KEY (version_id) REFERENCES dataset_versions(id) ON DELETE CASCADE,
+                    FOREIGN KEY (queue_id) REFERENCES annotation_queues(id)
+                )
+            """))
+            print("  recommended_filter_configs table created.")
+        else:
+            print("  recommended_filter_configs table already exists.")
+
     print("Migration completed successfully!")
 
 

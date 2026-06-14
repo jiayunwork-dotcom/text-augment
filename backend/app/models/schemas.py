@@ -390,6 +390,12 @@ class QueueStatus(str, Enum):
     closed = "closed"
 
 
+class PriorityStrategy(str, Enum):
+    uncertainty = "uncertainty"
+    class_balance = "class_balance"
+    hybrid = "hybrid"
+
+
 class AnnotationDecision(str, Enum):
     confirm = "confirm"
     relabel = "relabel"
@@ -412,6 +418,9 @@ class AnnotationQueueCreate(BaseModel):
     num_reviewers: int = Field(default=1, ge=1, le=9)
     lock_timeout_minutes: int = Field(default=30, ge=1, le=1440)
     created_by: str = ""
+    priority_strategy: PriorityStrategy = PriorityStrategy.uncertainty
+    webhook_url: Optional[str] = None
+    webhook_thresholds: list[float] = []
 
 
 class QueueProgressStats(BaseModel):
@@ -444,6 +453,10 @@ class AnnotationQueueResponse(BaseModel):
     completed_at: Optional[datetime] = None
     applied_at: Optional[datetime] = None
     target_version_id: Optional[int] = None
+    priority_strategy: PriorityStrategy = PriorityStrategy.uncertainty
+    webhook_url: Optional[str] = None
+    webhook_thresholds: list = []
+    triggered_thresholds: list = []
     progress: Optional[QueueProgressStats] = None
 
     class Config:
@@ -521,6 +534,48 @@ class AnnotatorStats(BaseModel):
     confirm_count: int = 0
     relabel_count: int = 0
     discard_count: int = 0
+    avg_annotation_seconds: Optional[float] = None
+    agreement_rate: Optional[float] = None
+    total_agreed: int = 0
+
+
+class AnnotatorPerformanceResponse(BaseModel):
+    annotator_id: str
+    total_annotated: int = 0
+    confirm_count: int = 0
+    relabel_count: int = 0
+    discard_count: int = 0
+    avg_annotation_seconds: Optional[float] = None
+    median_annotation_seconds: Optional[float] = None
+    agreement_rate: Optional[float] = None
+    total_agreed: int = 0
+    decision_distribution: dict = {}
+
+
+class BulkImportResult(BaseModel):
+    total_records: int = 0
+    imported_count: int = 0
+    errors: list = []
+    sample_ids_not_found: list = []
+    invalid_decisions: list = []
+    missing_new_labels: list = []
+
+
+class RecommendedFilterConfigResponse(BaseModel):
+    id: int
+    version_id: int
+    queue_id: Optional[int] = None
+    source_config_name: str = "standard"
+    ppl_multiplier: Optional[float] = None
+    similarity_threshold: Optional[float] = None
+    jaccard_threshold: Optional[float] = None
+    label_confidence_threshold: Optional[float] = None
+    adjustments: dict = {}
+    reasoning: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
 
 
 class ConsistencyReport(BaseModel):

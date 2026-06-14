@@ -1,6 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from datetime import datetime
+from typing import Optional
 
 from ..database import get_session
 from ..models.db_models import (
@@ -12,6 +14,8 @@ from ..models.schemas import (
     ClaimTasksRequest, SubmitAnnotationsRequest,
     ReleaseLocksRequest, ArbitrateRequest,
     ApplyQueueRequest, ConsistencyReport,
+    AnnotatorPerformanceResponse, BulkImportResult,
+    RecommendedFilterConfigResponse,
 )
 from ..services import annotation as annotation_service
 
@@ -226,3 +230,78 @@ async def get_consistency_report(
         raise HTTPException(status_code=400, detail=str(e))
 
     return report
+
+
+@router.get("/queues/{queue_id}/annotators", response_model=list[AnnotatorPerformanceResponse])
+async def get_queue_annotator_performances(
+    queue_id: int,
+    start_time: Optional[datetime] = Query(None, description="Start time for filtering (ISO format)"),
+    end_time: Optional[datetime] = Query(None, description="End time for filtering (ISO format)"),
+    session: AsyncSession = Depends(get_session),
+):
+    stmt = select(AnnotationQueue).where(AnnotationQueue.id == queue_id)
+    result = await session.execute(stmt)
+    queue = result.scalar_one_or_none()
+    if not queue:
+        raise HTTPException(status_code=404, detail="Annotation queue not found")
+
+    performances = await annotation_service.get_queue_annotator_performances(
+        session, queue_id, start_time=start_time, end_time=end_time
+    )
+    return performances
+
+
+@router.get("/annotators/{annotator_id}/performance", response_model=AnnotatorPerformanceResponse)
+async def get_annotator_performance(
+    annotator_id: str,
+    queue_id: Optional[int] = Query(None, description="Filter by queue ID"),
+    start_time: Optional[datetime] = Query(None, description="Start time for filtering (ISO format)"),
+    end_time: Optional[datetime] = Query(None, description="End time for filtering (ISO format)"),
+    session: AsyncSession = Depends(get_session),
+):
+    performance = await annotation_service.get_annotator_performance(
+        session, annotator_id, queue_id=queue_id,
+        start_time=start_time, end_time=end_time
+    )
+    if performance.total_annotated == 0 and queue_id is not None:
+        stmt = select(AnnotationQueue).where(AnnotationQueue.id == queue_id)
+        result = await session.execute(stmt)
+        if not result.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="Queue not found")
+    return performance
+
+
+@router.post("/queues/{queue_id}/import", response_model=BulkImportResult)
+async def bulk_import_annotations(
+    queue_id: int,
+    file: UploadFile = File(..., description="CSV file with columns: sample_id, decision, new_label, annotator_id"),
+    session: AsyncSession = Depends(get_session),
+):
+    if not file.filename or not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Only CSV files are supported")
+
+    try:
+        content = await file.read()
+        csv_content = content.decode('utf-8')
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read file: {e}")
+
+    try:
+        result = await annotation_service.bulk_import_annotations(
+            session, queue_id, csv_content
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return result
+
+
+@router.get("/recommended-filter-configs", response_model=list[RecommendedFilterConfigResponse])
+async def get_recommended_filter_configs(
+    version_id: Optional[int] = Query(None, description="Filter by annotated version ID"),
+    session: AsyncSession = Depends(get_session),
+):
+    configs = await annotation_service.get_recommended_filter_configs(
+        session, version_id=version_id
+    )
+    return configs

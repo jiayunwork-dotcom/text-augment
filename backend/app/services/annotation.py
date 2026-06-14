@@ -1,20 +1,27 @@
 import logging
+import csv
+import io
+import asyncio
 from datetime import datetime, timedelta
 from collections import Counter, defaultdict
 from typing import Optional
 
-from sqlalchemy import select, and_, or_, func
+import httpx
+from sqlalchemy import select, and_, or_, func, case
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models.db_models import (
     AnnotationQueue, AnnotationItem, AnnotationRecord,
     QueueStatus, AnnotationStatus, AnnotationDecision,
-    DatasetVersion, Sample, Dataset,
+    DatasetVersion, Sample, Dataset, PriorityStrategy,
+    WebhookLog, RecommendedFilterConfig,
 )
 from ..models.schemas import (
     AnnotationQueueCreate, QueueProgressStats,
     ConsistencyReport, AnnotatorStats,
+    AnnotatorPerformanceResponse, BulkImportResult,
 )
+from ..config import FILTER_PRESETS
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +146,11 @@ async def create_annotation_queue(
                 f"Got {request.num_reviewers}, please use an odd number."
             )
 
+    if request.webhook_thresholds:
+        for t in request.webhook_thresholds:
+            if t <= 0 or t > 100:
+                raise ValueError(f"Webhook threshold {t} is invalid. Must be between 0 and 100.")
+
     name = request.name or f"annotation_queue_v{version.id}"
 
     queue = AnnotationQueue(
@@ -150,6 +162,10 @@ async def create_annotation_queue(
         num_reviewers=request.num_reviewers,
         lock_timeout_minutes=request.lock_timeout_minutes,
         created_by=request.created_by or None,
+        priority_strategy=request.priority_strategy,
+        webhook_url=request.webhook_url,
+        webhook_thresholds=sorted(set(request.webhook_thresholds)),
+        triggered_thresholds=[],
     )
     session.add(queue)
     await session.flush()
@@ -174,6 +190,116 @@ async def create_annotation_queue(
     await session.refresh(queue)
 
     return queue
+
+
+async def _get_annotated_class_distribution(
+    session: AsyncSession,
+    queue_id: int,
+) -> dict[str, int]:
+    stmt = (
+        select(Sample.label, func.count(AnnotationItem.id))
+        .select_from(AnnotationItem)
+        .join(Sample, AnnotationItem.sample_id == Sample.id)
+        .where(
+            and_(
+                AnnotationItem.queue_id == queue_id,
+                AnnotationItem.status.in_([
+                    AnnotationStatus.annotated,
+                    AnnotationStatus.arbitrated,
+                ]),
+            )
+        )
+        .group_by(Sample.label)
+    )
+    result = await session.execute(stmt)
+    rows = result.all()
+    return {label: count for label, count in rows}
+
+
+async def _get_all_classes_in_queue(
+    session: AsyncSession,
+    queue_id: int,
+) -> list[str]:
+    stmt = (
+        select(Sample.label)
+        .select_from(AnnotationItem)
+        .join(Sample, AnnotationItem.sample_id == Sample.id)
+        .where(AnnotationItem.queue_id == queue_id)
+        .distinct()
+    )
+    result = await session.execute(stmt)
+    return [row[0] for row in result.all()]
+
+
+async def _compute_class_rarity_scores(
+    session: AsyncSession,
+    queue_id: int,
+    items: list[tuple[AnnotationItem, Sample]],
+) -> dict[int, float]:
+    annotated_dist = await _get_annotated_class_distribution(session, queue_id)
+    all_classes = await _get_all_classes_in_queue(session, queue_id)
+
+    for cls in all_classes:
+        if cls not in annotated_dist:
+            annotated_dist[cls] = 0
+
+    if not annotated_dist:
+        return {item.id: 0.5 for item, _ in items}
+
+    max_count = max(annotated_dist.values()) if annotated_dist else 1
+    if max_count == 0:
+        max_count = 1
+
+    rarity_scores = {}
+    for item, sample in items:
+        cls_count = annotated_dist.get(sample.label, 0)
+        rarity = 1.0 - (cls_count / max_count)
+        rarity_scores[item.id] = max(0.0, min(1.0, rarity))
+
+    return rarity_scores
+
+
+async def _compute_priority_order(
+    session: AsyncSession,
+    queue: AnnotationQueue,
+    rows: list[tuple[AnnotationItem, Sample]],
+) -> list[tuple[AnnotationItem, Sample]]:
+    if queue.priority_strategy == PriorityStrategy.uncertainty or not rows:
+        return rows
+
+    item_sample_map = {item.id: (item, sample) for item, sample in rows}
+
+    if queue.priority_strategy == PriorityStrategy.class_balance:
+        rarity_scores = await _compute_class_rarity_scores(session, queue.id, rows)
+        sorted_items = sorted(
+            rows,
+            key=lambda x: (
+                rarity_scores.get(x[0].id, 0.0),
+                x[0].uncertainty_score,
+            ),
+            reverse=True,
+        )
+        return sorted_items
+
+    elif queue.priority_strategy == PriorityStrategy.hybrid:
+        rarity_scores = await _compute_class_rarity_scores(session, queue.id, rows)
+        uncertainty_weight = 0.7
+        rarity_weight = 0.3
+
+        scored_rows = []
+        for item, sample in rows:
+            uncertainty_norm = item.uncertainty_score
+            rarity = rarity_scores.get(item.id, 0.0)
+            combined = (
+                uncertainty_weight * uncertainty_norm
+                + rarity_weight * rarity
+            )
+            scored_rows.append((item, sample, combined))
+
+        scored_rows.sort(key=lambda x: x[2], reverse=True)
+        return [(item, sample) for item, sample, _ in scored_rows]
+
+    return rows
 
 
 def _is_lock_expired(item: AnnotationItem, timeout_minutes: int) -> bool:
@@ -260,6 +386,8 @@ async def claim_tasks(
     )
     result2 = await session.execute(stmt2)
     rows = result2.all()
+
+    rows = await _compute_priority_order(session, queue, list(rows))
 
     claimed = []
     for item, sample in rows:
@@ -352,6 +480,11 @@ async def _resolve_item_status(
             if label_counts:
                 item.final_label = label_counts.most_common(1)[0][0]
 
+        for record in records:
+            record.is_final_decision = (
+                record.decision.value == majority_decision
+            )
+
         item.status = AnnotationStatus.annotated
     else:
         item.status = AnnotationStatus.disputed
@@ -429,13 +562,24 @@ async def submit_annotations(
                 existing_record.decision = submit_item.decision
                 existing_record.new_label = submit_item.new_label
                 existing_record.comment = submit_item.comment
+                existing_record.submitted_at = datetime.utcnow()
+                if item.locked_at:
+                    duration = (datetime.utcnow() - item.locked_at).total_seconds()
+                    existing_record.annotation_duration_seconds = duration
             else:
+                now = datetime.utcnow()
+                duration = None
+                if item.locked_at:
+                    duration = (now - item.locked_at).total_seconds()
                 record = AnnotationRecord(
                     item_id=item.id,
                     annotator_id=annotator_id,
                     decision=submit_item.decision,
                     new_label=submit_item.new_label,
                     comment=submit_item.comment,
+                    locked_at=item.locked_at,
+                    submitted_at=now,
+                    annotation_duration_seconds=duration,
                 )
                 session.add(record)
 
@@ -468,6 +612,8 @@ async def submit_annotations(
         queue.status = QueueStatus.completed
         queue.completed_at = datetime.utcnow()
         await session.commit()
+
+    await _check_and_trigger_webhooks(session, queue)
 
     return {
         "processed_count": processed_count,
@@ -647,6 +793,12 @@ async def arbitrate_items(
             item.arbitrated_by = arbitrator_id
             item.arbitrated_at = datetime.utcnow()
 
+            records_stmt = select(AnnotationRecord).where(AnnotationRecord.item_id == item.id)
+            records_result = await session.execute(records_stmt)
+            item_records = records_result.scalars().all()
+            for rec in item_records:
+                rec.is_final_decision = (rec.decision == arb_item.decision)
+
             processed_count += 1
         except Exception as e:
             errors.append({"item_id": getattr(arb_item, "item_id", "?"), "error": str(e)})
@@ -673,6 +825,8 @@ async def arbitrate_items(
         queue.status = QueueStatus.completed
         queue.completed_at = datetime.utcnow()
         await session.commit()
+
+    await _check_and_trigger_webhooks(session, queue)
 
     return {"processed_count": processed_count, "errors": errors, "remaining": remaining}
 
@@ -791,7 +945,241 @@ async def apply_queue_results(
 
     await session.commit()
     await session.refresh(new_version)
+
+    await _generate_recommended_filter_config(session, queue, new_version)
+
     return new_version
+
+
+FILTER_REASON_TO_PARAM = {
+    "high_ppl": "ppl_multiplier",
+    "low_similarity": "similarity_threshold",
+    "duplicate": "jaccard_threshold",
+    "label": "label_confidence_threshold",
+}
+
+
+async def _analyze_filter_reason_stats(
+    session: AsyncSession,
+    queue_id: int,
+) -> dict[str, dict]:
+    stmt = (
+        select(
+            Sample.filter_reason,
+            func.count(AnnotationItem.id),
+            func.sum(
+                case(
+                    (AnnotationItem.final_decision == AnnotationDecision.confirm, 1),
+                    else_=0,
+                )
+            ),
+            func.sum(
+                case(
+                    (AnnotationItem.final_decision == AnnotationDecision.discard, 1),
+                    else_=0,
+                )
+            ),
+            func.sum(
+                case(
+                    (AnnotationItem.final_decision == AnnotationDecision.relabel, 1),
+                    else_=0,
+                )
+            ),
+        )
+        .select_from(AnnotationItem)
+        .join(Sample, AnnotationItem.sample_id == Sample.id)
+        .where(
+            and_(
+                AnnotationItem.queue_id == queue_id,
+                Sample.is_filtered == True,
+                Sample.filter_reason.isnot(None),
+                AnnotationItem.status.in_([
+                    AnnotationStatus.annotated,
+                    AnnotationStatus.arbitrated,
+                ]),
+            )
+        )
+        .group_by(Sample.filter_reason)
+    )
+
+    result = await session.execute(stmt)
+    rows = result.all()
+
+    stats = {}
+    for filter_reason, total, confirms, discards, relabels in rows:
+        if not filter_reason:
+            continue
+        confirm_rate = confirms / total if total > 0 else 0.0
+        discard_rate = discards / total if total > 0 else 0.0
+        relabel_rate = relabels / total if total > 0 else 0.0
+        stats[filter_reason] = {
+            "total": total,
+            "confirm_count": confirms,
+            "discard_count": discards,
+            "relabel_count": relabels,
+            "confirm_rate": round(confirm_rate, 4),
+            "discard_rate": round(discard_rate, 4),
+            "relabel_rate": round(relabel_rate, 4),
+        }
+
+    return stats
+
+
+def _adjust_ppl_multiplier(current: float, direction: str) -> float:
+    adjustment = current * 0.1
+    if direction == "relax":
+        return round(current + adjustment, 4)
+    else:
+        return round(max(0.1, current - adjustment), 4)
+
+
+def _adjust_similarity_threshold(current: float, direction: str) -> float:
+    adjustment = current * 0.1
+    if direction == "relax":
+        return round(max(0.0, current - adjustment), 4)
+    else:
+        return round(min(1.0, current + adjustment), 4)
+
+
+def _adjust_jaccard_threshold(current: float, direction: str) -> float:
+    adjustment = current * 0.1
+    if direction == "relax":
+        return round(min(1.0, current + adjustment), 4)
+    else:
+        return round(max(0.0, current - adjustment), 4)
+
+
+def _adjust_label_confidence_threshold(current: float, direction: str) -> float:
+    adjustment = current * 0.1
+    if direction == "relax":
+        return round(max(0.0, current - adjustment), 4)
+    else:
+        return round(min(1.0, current + adjustment), 4)
+
+
+PARAM_ADJUSTERS = {
+    "ppl_multiplier": _adjust_ppl_multiplier,
+    "similarity_threshold": _adjust_similarity_threshold,
+    "jaccard_threshold": _adjust_jaccard_threshold,
+    "label_confidence_threshold": _adjust_label_confidence_threshold,
+}
+
+
+async def _generate_recommended_filter_config(
+    session: AsyncSession,
+    queue: AnnotationQueue,
+    annotated_version: DatasetVersion,
+) -> Optional[RecommendedFilterConfig]:
+    try:
+        source_version_stmt = select(DatasetVersion).where(
+            DatasetVersion.id == queue.version_id
+        )
+        source_version_result = await session.execute(source_version_stmt)
+        source_version = source_version_result.scalar_one_or_none()
+
+        if not source_version:
+            return None
+
+        source_strictness = source_version.filter_strictness or "standard"
+        base_config = FILTER_PRESETS.get(source_strictness, FILTER_PRESETS["standard"])
+
+        filter_stats = await _analyze_filter_reason_stats(session, queue.id)
+
+        if not filter_stats:
+            return None
+
+        adjustments = {}
+        reasoning_parts = []
+        new_config = dict(base_config)
+
+        for filter_reason, stats in filter_stats.items():
+            param_name = FILTER_REASON_TO_PARAM.get(filter_reason)
+            if not param_name or param_name not in base_config:
+                continue
+
+            current_value = base_config[param_name]
+            confirm_rate = stats["confirm_rate"]
+            discard_rate = stats["discard_rate"]
+            total = stats["total"]
+
+            if total < 5:
+                continue
+
+            if confirm_rate > 0.8:
+                adjuster = PARAM_ADJUSTERS.get(param_name)
+                if adjuster:
+                    new_value = adjuster(current_value, "relax")
+                    new_config[param_name] = new_value
+                    adjustments[param_name] = {
+                        "from": current_value,
+                        "to": new_value,
+                        "reason": f"high_confirm_rate ({confirm_rate:.1%} > 80%)",
+                        "filter_reason": filter_reason,
+                        "sample_count": total,
+                    }
+                    reasoning_parts.append(
+                        f"{filter_reason}: confirm rate {confirm_rate:.1%} > 80%, "
+                        f"{param_name} {current_value} → {new_value} (relaxed)"
+                    )
+
+            elif discard_rate > 0.6:
+                adjuster = PARAM_ADJUSTERS.get(param_name)
+                if adjuster:
+                    new_value = adjuster(current_value, "tighten")
+                    new_config[param_name] = new_value
+                    adjustments[param_name] = {
+                        "from": current_value,
+                        "to": new_value,
+                        "reason": f"high_discard_rate ({discard_rate:.1%} > 60%)",
+                        "filter_reason": filter_reason,
+                        "sample_count": total,
+                    }
+                    reasoning_parts.append(
+                        f"{filter_reason}: discard rate {discard_rate:.1%} > 60%, "
+                        f"{param_name} {current_value} → {new_value} (tightened)"
+                    )
+
+        if not adjustments:
+            return None
+
+        recommended = RecommendedFilterConfig(
+            version_id=annotated_version.id,
+            queue_id=queue.id,
+            source_config_name=source_strictness,
+            ppl_multiplier=new_config.get("ppl_multiplier"),
+            similarity_threshold=new_config.get("similarity_threshold"),
+            jaccard_threshold=new_config.get("jaccard_threshold"),
+            label_confidence_threshold=new_config.get("label_confidence_threshold"),
+            adjustments=adjustments,
+            reasoning="\n".join(reasoning_parts) if reasoning_parts else None,
+        )
+        session.add(recommended)
+        await session.commit()
+        await session.refresh(recommended)
+
+        logger.info(
+            f"Generated recommended filter config for version {annotated_version.id} "
+            f"based on queue {queue.id}: {len(adjustments)} adjustments"
+        )
+
+        return recommended
+
+    except Exception as e:
+        logger.exception(f"Failed to generate recommended filter config for queue {queue.id}")
+        return None
+
+
+async def get_recommended_filter_configs(
+    session: AsyncSession,
+    version_id: Optional[int] = None,
+) -> list[RecommendedFilterConfig]:
+    stmt = select(RecommendedFilterConfig).order_by(RecommendedFilterConfig.created_at.desc())
+
+    if version_id is not None:
+        stmt = stmt.where(RecommendedFilterConfig.version_id == version_id)
+
+    result = await session.execute(stmt)
+    return result.scalars().all()
 
 
 def _compute_cohens_kappa(
@@ -902,3 +1290,321 @@ async def get_consistency_report(
         report.warning = f"Cohen's Kappa ({overall_kappa}) is below 0.6 threshold. Annotation consistency needs attention."
 
     return report
+
+
+async def get_annotator_performance(
+    session: AsyncSession,
+    annotator_id: str,
+    queue_id: Optional[int] = None,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+) -> AnnotatorPerformanceResponse:
+    stmt = select(AnnotationRecord).where(AnnotationRecord.annotator_id == annotator_id)
+
+    if queue_id is not None:
+        stmt = stmt.join(AnnotationItem, AnnotationRecord.item_id == AnnotationItem.id)
+        stmt = stmt.where(AnnotationItem.queue_id == queue_id)
+
+    if start_time:
+        stmt = stmt.where(AnnotationRecord.submitted_at >= start_time)
+    if end_time:
+        stmt = stmt.where(AnnotationRecord.submitted_at <= end_time)
+
+    result = await session.execute(stmt)
+    records = result.scalars().all()
+
+    response = AnnotatorPerformanceResponse(annotator_id=annotator_id)
+    response.total_annotated = len(records)
+
+    durations = []
+    decision_counts = Counter()
+
+    for record in records:
+        if record.decision == AnnotationDecision.confirm:
+            response.confirm_count += 1
+        elif record.decision == AnnotationDecision.relabel:
+            response.relabel_count += 1
+        elif record.decision == AnnotationDecision.discard:
+            response.discard_count += 1
+
+        decision_counts[record.decision.value] += 1
+
+        if record.annotation_duration_seconds is not None:
+            durations.append(record.annotation_duration_seconds)
+
+        if record.is_final_decision:
+            response.total_agreed += 1
+
+    if durations:
+        response.avg_annotation_seconds = round(sum(durations) / len(durations), 2)
+        sorted_durations = sorted(durations)
+        mid = len(sorted_durations) // 2
+        if len(sorted_durations) % 2 == 0:
+            response.median_annotation_seconds = round(
+                (sorted_durations[mid - 1] + sorted_durations[mid]) / 2, 2
+            )
+        else:
+            response.median_annotation_seconds = round(sorted_durations[mid], 2)
+
+    if response.total_annotated > 0:
+        response.agreement_rate = round(response.total_agreed / response.total_annotated, 4)
+        response.decision_distribution = dict(decision_counts)
+
+    return response
+
+
+async def get_queue_annotator_performances(
+    session: AsyncSession,
+    queue_id: int,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+) -> list[AnnotatorPerformanceResponse]:
+    stmt = (
+        select(AnnotationRecord.annotator_id)
+        .join(AnnotationItem, AnnotationRecord.item_id == AnnotationItem.id)
+        .where(AnnotationItem.queue_id == queue_id)
+        .distinct()
+    )
+    result = await session.execute(stmt)
+    annotator_ids = [row[0] for row in result.all()]
+
+    performances = []
+    for aid in annotator_ids:
+        perf = await get_annotator_performance(
+            session, aid, queue_id=queue_id,
+            start_time=start_time, end_time=end_time
+        )
+        performances.append(perf)
+
+    performances.sort(key=lambda x: x.total_annotated, reverse=True)
+    return performances
+
+
+async def _send_webhook_notification(
+    session: AsyncSession,
+    queue: AnnotationQueue,
+    threshold: float,
+    progress: QueueProgressStats,
+) -> None:
+    if not queue.webhook_url:
+        return
+
+    try:
+        finalized = progress.annotated + progress.arbitrated
+        percentage = round(finalized / progress.total * 100, 2) if progress.total > 0 else 0.0
+
+        decision_distribution = {}
+        if finalized > 0:
+            decision_distribution = {
+                "confirm": round(progress.confirm_count / finalized, 4),
+                "relabel": round(progress.relabel_count / finalized, 4),
+                "discard": round(progress.discard_count / finalized, 4),
+            }
+
+        payload = {
+            "queue_id": queue.id,
+            "queue_name": queue.name,
+            "threshold": threshold,
+            "current_progress_percent": percentage,
+            "total_samples": progress.total,
+            "annotated_count": finalized,
+            "pending_count": progress.pending,
+            "locked_count": progress.locked,
+            "decision_distribution": decision_distribution,
+            "confirm_count": progress.confirm_count,
+            "relabel_count": progress.relabel_count,
+            "discard_count": progress.discard_count,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+        success = False
+        status_code = None
+        response_body = None
+        error_message = None
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(queue.webhook_url, json=payload)
+                status_code = resp.status_code
+                success = 200 <= resp.status_code < 300
+                try:
+                    response_body = resp.text[:500]
+                except Exception:
+                    response_body = None
+        except Exception as e:
+            error_message = str(e)
+            logger.warning(f"Webhook notification failed for queue {queue.id} at threshold {threshold}: {e}")
+
+        webhook_log = WebhookLog(
+            queue_id=queue.id,
+            threshold=threshold,
+            url=queue.webhook_url,
+            status_code=status_code,
+            success=success,
+            response_body=response_body,
+            error_message=error_message,
+        )
+        session.add(webhook_log)
+
+        if success:
+            triggered = list(queue.triggered_thresholds or [])
+            if threshold not in triggered:
+                triggered.append(threshold)
+                queue.triggered_thresholds = triggered
+
+        await session.commit()
+
+    except Exception as e:
+        logger.exception(f"Error sending webhook notification for queue {queue.id}")
+
+
+async def _check_and_trigger_webhooks(
+    session: AsyncSession,
+    queue: AnnotationQueue,
+) -> None:
+    if not queue.webhook_url or not queue.webhook_thresholds:
+        return
+
+    progress = await get_queue_progress(session, queue.id)
+    finalized = progress.annotated + progress.arbitrated
+    percentage = (finalized / progress.total * 100) if progress.total > 0 else 0.0
+
+    triggered = set(queue.triggered_thresholds or [])
+
+    for threshold in queue.webhook_thresholds:
+        if threshold in triggered:
+            continue
+        if percentage >= threshold:
+            await _send_webhook_notification(session, queue, threshold, progress)
+
+
+async def bulk_import_annotations(
+    session: AsyncSession,
+    queue_id: int,
+    csv_content: str,
+) -> BulkImportResult:
+    stmt = select(AnnotationQueue).where(AnnotationQueue.id == queue_id)
+    result = await session.execute(stmt)
+    queue = result.scalar_one_or_none()
+
+    if not queue:
+        raise ValueError("Queue not found")
+
+    if queue.status in [QueueStatus.applied, QueueStatus.closed]:
+        raise ValueError(f"Queue is {queue.status.value}, cannot import annotations")
+
+    result_data = BulkImportResult()
+
+    try:
+        reader = csv.DictReader(io.StringIO(csv_content))
+    except Exception as e:
+        raise ValueError(f"Failed to parse CSV: {e}")
+
+    required_columns = {"sample_id", "decision", "new_label", "annotator_id"}
+    if not required_columns.issubset(set(reader.fieldnames or [])):
+        missing = required_columns - set(reader.fieldnames or [])
+        raise ValueError(f"CSV missing required columns: {missing}")
+
+    item_sample_map: dict[int, AnnotationItem] = {}
+    items_stmt = select(AnnotationItem).where(AnnotationItem.queue_id == queue_id)
+    items_result = await session.execute(items_stmt)
+    for item in items_result.scalars().all():
+        item_sample_map[item.sample_id] = item
+
+    valid_decisions = {d.value for d in AnnotationDecision}
+
+    rows = list(reader)
+    result_data.total_records = len(rows)
+
+    import_items: list[tuple[int, str, AnnotationDecision, Optional[str]]] = []
+
+    for i, row in enumerate(rows):
+        row_num = i + 2
+        try:
+            sample_id = int(row["sample_id"].strip())
+        except (ValueError, TypeError):
+            result_data.errors.append(
+                {"row": row_num, "error": f"Invalid sample_id: {row['sample_id']}"}
+            )
+            continue
+
+        decision_str = row["decision"].strip().lower()
+        annotator_id = row["annotator_id"].strip()
+        new_label = row["new_label"].strip() if row["new_label"] else None
+
+        if sample_id not in item_sample_map:
+            result_data.sample_ids_not_found.append(sample_id)
+            result_data.errors.append(
+                {"row": row_num, "sample_id": sample_id, "error": "Sample not found in queue"}
+            )
+            continue
+
+        if decision_str not in valid_decisions:
+            result_data.invalid_decisions.append(decision_str)
+            result_data.errors.append(
+                {"row": row_num, "sample_id": sample_id, "error": f"Invalid decision: {decision_str}"}
+            )
+            continue
+
+        decision = AnnotationDecision(decision_str)
+
+        if decision == AnnotationDecision.relabel and not new_label:
+            result_data.missing_new_labels.append(sample_id)
+            result_data.errors.append(
+                {"row": row_num, "sample_id": sample_id, "error": "new_label is required for relabel decision"}
+            )
+            continue
+
+        if not annotator_id:
+            result_data.errors.append(
+                {"row": row_num, "sample_id": sample_id, "error": "annotator_id is required"}
+            )
+            continue
+
+        import_items.append((sample_id, annotator_id, decision, new_label))
+
+    for sample_id, annotator_id, decision, new_label in import_items:
+        try:
+            item = item_sample_map[sample_id]
+
+            existing_stmt = select(AnnotationRecord).where(
+                and_(
+                    AnnotationRecord.item_id == item.id,
+                    AnnotationRecord.annotator_id == annotator_id,
+                )
+            )
+            existing_result = await session.execute(existing_stmt)
+            existing_record = existing_result.scalar_one_or_none()
+
+            now = datetime.utcnow()
+
+            if existing_record:
+                existing_record.decision = decision
+                existing_record.new_label = new_label
+                existing_record.submitted_at = now
+            else:
+                record = AnnotationRecord(
+                    item_id=item.id,
+                    annotator_id=annotator_id,
+                    decision=decision,
+                    new_label=new_label,
+                    submitted_at=now,
+                    created_at=now,
+                )
+                session.add(record)
+
+            await session.flush()
+            await _resolve_item_status(session, item, queue)
+
+            result_data.imported_count += 1
+        except Exception as e:
+            logger.exception(f"Error importing annotation for sample {sample_id}")
+            result_data.errors.append(
+                {"sample_id": sample_id, "annotator_id": annotator_id, "error": str(e)}
+            )
+
+    await session.commit()
+
+    await _check_and_trigger_webhooks(session, queue)
+
+    return result_data
