@@ -964,11 +964,14 @@ async def _analyze_filter_reason_stats(
     queue_id: int,
     augmented_version_id: Optional[int] = None,
 ) -> dict[str, dict]:
+    logger.info(f"[FilterStats] Starting analysis for queue {queue_id}")
+
     if augmented_version_id is None:
         queue_stmt = select(AnnotationQueue).where(AnnotationQueue.id == queue_id)
         queue_result = await session.execute(queue_stmt)
         queue = queue_result.scalar_one_or_none()
         if not queue:
+            logger.warning(f"[FilterStats] Queue {queue_id} not found")
             return {}
 
         source_version_stmt = select(DatasetVersion).where(
@@ -978,15 +981,17 @@ async def _analyze_filter_reason_stats(
         source_version = source_version_result.scalar_one_or_none()
         if source_version and source_version.parent_version_id:
             augmented_version_id = source_version.parent_version_id
+            logger.info(f"[FilterStats] Using augmented version_id={augmented_version_id} "
+                        f"(from source version parent)")
+        elif source_version:
+            augmented_version_id = queue.version_id
+            logger.info(f"[FilterStats] No parent version, using queue's source version_id={augmented_version_id} as fallback")
 
     if augmented_version_id is None:
-        logger.warning(
-            f"Cannot determine augmented version for queue {queue_id}, "
-            f"filter reason stats will be unavailable"
-        )
+        logger.warning(f"[FilterStats] Cannot determine version for queue {queue_id}")
         return {}
 
-    items_stmt = (
+    finalized_stmt = (
         select(AnnotationItem, Sample)
         .join(Sample, AnnotationItem.sample_id == Sample.id)
         .where(
@@ -999,54 +1004,58 @@ async def _analyze_filter_reason_stats(
             )
         )
     )
-    items_result = await session.execute(items_stmt)
-    annotated_items = items_result.all()
+    finalized_result = await session.execute(finalized_stmt)
+    finalized_items = finalized_result.all()
 
-    if not annotated_items:
-        logger.info(f"No annotated items found for queue {queue_id}")
+    logger.info(f"[FilterStats] Found {len(finalized_items)} finalized annotated items")
+
+    if not finalized_items:
         return {}
 
-    filtered_sample_ids = []
-    sample_to_item = {}
-    for item, filtered_sample in annotated_items:
-        aug_sample_id = filtered_sample.source_sample_id or filtered_sample.id
-        filtered_sample_ids.append(aug_sample_id)
-        sample_to_item[aug_sample_id] = item
+    filtered_sample_to_source: dict[int, AnnotationItem] = {}
+    aug_sample_ids = []
 
-    if not filtered_sample_ids:
-        return {}
+    for item, filtered_sample in finalized_items:
+        aug_sample_id = filtered_sample.source_sample_id
+        if aug_sample_id is None:
+            aug_sample_id = filtered_sample.id
+            logger.debug(f"[FilterStats] sample {filtered_sample.id} has no source_sample_id, "
+                        f"using own id={aug_sample_id}")
+
+        aug_sample_ids.append(aug_sample_id)
+        filtered_sample_to_source[aug_sample_id] = item
+
+    logger.info(f"[FilterStats] Looking up {len(aug_sample_ids)} samples in version {augmented_version_id} "
+                f"with is_filtered=True and filter_reason IS NOT NULL")
 
     aug_samples_stmt = select(Sample).where(
         and_(
-            Sample.id.in_(filtered_sample_ids),
+            Sample.id.in_(aug_sample_ids),
             Sample.version_id == augmented_version_id,
-            Sample.is_filtered == True,
-            Sample.filter_reason.isnot(None),
         )
     )
     aug_samples_result = await session.execute(aug_samples_stmt)
-    aug_samples = aug_samples_result.scalars().all()
+    all_aug_samples = aug_samples_result.scalars().all()
 
-    if not aug_samples:
-        logger.info(
-            f"No filtered samples found in augmented version {augmented_version_id} "
-            f"for queue {queue_id}. Trying fallback to source version filter_reason..."
-        )
-        return await _analyze_filter_reason_stats_fallback(session, queue_id)
+    logger.info(f"[FilterStats] Found {len(all_aug_samples)} samples in aug version "
+                f"(is_filtered=True and filter_reason: "
+                f"{sum(1 for s in all_aug_samples if s.is_filtered and s.filter_reason)})")
 
     filter_reason_counts = defaultdict(lambda: {
         "total": 0, "confirm_count": 0, "discard_count": 0, "relabel_count": 0
     })
 
-    for aug_sample in aug_samples:
-        item = sample_to_item.get(aug_sample.id)
+    matched_count = 0
+    for aug_sample in all_aug_samples:
+        if not aug_sample.is_filtered or not aug_sample.filter_reason:
+            continue
+
+        item = filtered_sample_to_source.get(aug_sample.id)
         if not item:
             continue
 
+        matched_count += 1
         reason = aug_sample.filter_reason
-        if not reason:
-            continue
-
         filter_reason_counts[reason]["total"] += 1
         if item.final_decision == AnnotationDecision.confirm:
             filter_reason_counts[reason]["confirm_count"] += 1
@@ -1054,6 +1063,26 @@ async def _analyze_filter_reason_stats(
             filter_reason_counts[reason]["discard_count"] += 1
         elif item.final_decision == AnnotationDecision.relabel:
             filter_reason_counts[reason]["relabel_count"] += 1
+
+    logger.info(f"[FilterStats] Matched {matched_count} samples with filter reasons from aug version")
+
+    if matched_count == 0:
+        logger.info(f"[FilterStats] Trying fallback: checking filter_reason in queue source version samples")
+        for item, filtered_sample in finalized_items:
+            reason = filtered_sample.filter_reason
+            if not reason:
+                continue
+            item_obj = item
+            filter_reason_counts[reason]["total"] += 1
+            if item_obj.final_decision == AnnotationDecision.confirm:
+                filter_reason_counts[reason]["confirm_count"] += 1
+            elif item_obj.final_decision == AnnotationDecision.discard:
+                filter_reason_counts[reason]["discard_count"] += 1
+            elif item_obj.final_decision == AnnotationDecision.relabel:
+                filter_reason_counts[reason]["relabel_count"] += 1
+
+        matched_count = sum(c["total"] for c in filter_reason_counts.values())
+        logger.info(f"[FilterStats] Fallback found {matched_count} samples with filter reasons")
 
     stats = {}
     for reason, counts in filter_reason_counts.items():
@@ -1073,6 +1102,7 @@ async def _analyze_filter_reason_stats(
             "relabel_rate": round(relabel_rate, 4),
         }
 
+    logger.info(f"[FilterStats] Final result: {len(stats)} filter reasons with data: {stats}")
     return stats
 
 
@@ -1185,78 +1215,97 @@ async def _generate_recommended_filter_config(
     queue: AnnotationQueue,
     annotated_version: DatasetVersion,
 ) -> Optional[RecommendedFilterConfig]:
+    logger.info(f"[GenReco] Starting for queue={queue.id}")
+
+    source_version_stmt = select(DatasetVersion).where(
+        DatasetVersion.id == queue.version_id
+    )
+    source_version_result = await session.execute(source_version_stmt)
+    source_version = source_version_result.scalar_one_or_none()
+
+    if not source_version:
+        logger.warning(f"[GenReco] source version {queue.version_id} not found, aborting")
+        return None
+
+    source_strictness = source_version.filter_strictness or "standard"
+    base_config = FILTER_PRESETS.get(source_strictness, FILTER_PRESETS["standard"])
+    logger.info(f"[GenReco] source version type={source_version.version_type}, "
+                f"strictness={source_strictness}, base_config={base_config}")
+
+    filter_stats = await _analyze_filter_reason_stats(session, queue.id)
+
+    if not filter_stats:
+        logger.info(f"[GenReco] No filter stats available, aborting")
+        return None
+
+    adjustments = {}
+    reasoning_parts = []
+    new_config = dict(base_config)
+
+    for filter_reason, stats in filter_stats.items():
+        param_name = FILTER_REASON_TO_PARAM.get(filter_reason)
+        logger.debug(f"[GenReco] Processing {filter_reason}: stats={stats}, param_name={param_name}")
+
+        if not param_name:
+            logger.debug(f"  -> no param mapping, skip")
+            continue
+
+        if param_name not in base_config:
+            logger.debug(f"  -> {param_name} not in base_config, skip")
+            continue
+
+        current_value = base_config[param_name]
+        confirm_rate = stats["confirm_rate"]
+        discard_rate = stats["discard_rate"]
+        total = stats["total"]
+
+        if total < 5:
+            logger.debug(f"  -> total={total} < 5, skip (need >= 5 samples)")
+            continue
+
+        if confirm_rate > 0.8:
+            adjuster = PARAM_ADJUSTERS.get(param_name)
+            if adjuster:
+                new_value = adjuster(current_value, "relax")
+                new_config[param_name] = new_value
+                adjustments[param_name] = {
+                    "from": current_value,
+                    "to": new_value,
+                    "reason": f"high_confirm_rate ({confirm_rate:.1%} > 80%)",
+                    "filter_reason": filter_reason,
+                    "sample_count": total,
+                }
+                reasoning_parts.append(
+                    f"{filter_reason}: confirm rate {confirm_rate:.1%} > 80%, "
+                    f"{param_name} {current_value} → {new_value} (relaxed)"
+                )
+                logger.info(f"[GenReco]  ✓ relax {param_name}: {current_value} -> {new_value}")
+
+        elif discard_rate > 0.6:
+            adjuster = PARAM_ADJUSTERS.get(param_name)
+            if adjuster:
+                new_value = adjuster(current_value, "tighten")
+                new_config[param_name] = new_value
+                adjustments[param_name] = {
+                    "from": current_value,
+                    "to": new_value,
+                    "reason": f"high_discard_rate ({discard_rate:.1%} > 60%)",
+                    "filter_reason": filter_reason,
+                    "sample_count": total,
+                }
+                reasoning_parts.append(
+                    f"{filter_reason}: discard rate {discard_rate:.1%} > 60%, "
+                    f"{param_name} {current_value} → {new_value} (tightened)"
+                )
+                logger.info(f"[GenReco]  ✓ tighten {param_name}: {current_value} -> {new_value}")
+
+    if not adjustments:
+        logger.info(f"[GenReco] No adjustments needed")
+        return None
+
+    logger.info(f"[GenReco] Total adjustments: {len(adjustments)}")
+
     try:
-        source_version_stmt = select(DatasetVersion).where(
-            DatasetVersion.id == queue.version_id
-        )
-        source_version_result = await session.execute(source_version_stmt)
-        source_version = source_version_result.scalar_one_or_none()
-
-        if not source_version:
-            return None
-
-        source_strictness = source_version.filter_strictness or "standard"
-        base_config = FILTER_PRESETS.get(source_strictness, FILTER_PRESETS["standard"])
-
-        filter_stats = await _analyze_filter_reason_stats(session, queue.id)
-
-        if not filter_stats:
-            return None
-
-        adjustments = {}
-        reasoning_parts = []
-        new_config = dict(base_config)
-
-        for filter_reason, stats in filter_stats.items():
-            param_name = FILTER_REASON_TO_PARAM.get(filter_reason)
-            if not param_name or param_name not in base_config:
-                continue
-
-            current_value = base_config[param_name]
-            confirm_rate = stats["confirm_rate"]
-            discard_rate = stats["discard_rate"]
-            total = stats["total"]
-
-            if total < 5:
-                continue
-
-            if confirm_rate > 0.8:
-                adjuster = PARAM_ADJUSTERS.get(param_name)
-                if adjuster:
-                    new_value = adjuster(current_value, "relax")
-                    new_config[param_name] = new_value
-                    adjustments[param_name] = {
-                        "from": current_value,
-                        "to": new_value,
-                        "reason": f"high_confirm_rate ({confirm_rate:.1%} > 80%)",
-                        "filter_reason": filter_reason,
-                        "sample_count": total,
-                    }
-                    reasoning_parts.append(
-                        f"{filter_reason}: confirm rate {confirm_rate:.1%} > 80%, "
-                        f"{param_name} {current_value} → {new_value} (relaxed)"
-                    )
-
-            elif discard_rate > 0.6:
-                adjuster = PARAM_ADJUSTERS.get(param_name)
-                if adjuster:
-                    new_value = adjuster(current_value, "tighten")
-                    new_config[param_name] = new_value
-                    adjustments[param_name] = {
-                        "from": current_value,
-                        "to": new_value,
-                        "reason": f"high_discard_rate ({discard_rate:.1%} > 60%)",
-                        "filter_reason": filter_reason,
-                        "sample_count": total,
-                    }
-                    reasoning_parts.append(
-                        f"{filter_reason}: discard rate {discard_rate:.1%} > 60%, "
-                        f"{param_name} {current_value} → {new_value} (tightened)"
-                    )
-
-        if not adjustments:
-            return None
-
         recommended = RecommendedFilterConfig(
             version_id=annotated_version.id,
             queue_id=queue.id,
@@ -1273,14 +1322,13 @@ async def _generate_recommended_filter_config(
         await session.refresh(recommended)
 
         logger.info(
-            f"Generated recommended filter config for version {annotated_version.id} "
-            f"based on queue {queue.id}: {len(adjustments)} adjustments"
+            f"[GenReco] SUCCESS: created RecommendedFilterConfig id={recommended.id}"
         )
 
         return recommended
 
     except Exception as e:
-        logger.exception(f"Failed to generate recommended filter config for queue {queue.id}")
+        logger.exception(f"[GenReco] Failed to save RecommendedFilterConfig: {e}")
         return None
 
 

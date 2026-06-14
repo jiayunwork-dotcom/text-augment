@@ -22,6 +22,21 @@ from ..services import annotation as annotation_service
 router = APIRouter(prefix="/annotation", tags=["annotation"])
 
 
+def _parse_datetime_param(
+    value: Optional[str],
+    param_name: str,
+) -> Optional[datetime]:
+    if value is None or value == "":
+        return None
+    try:
+        return datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid format for {param_name}: {value}. Expected ISO 8601 format (e.g. 2024-01-01T00:00:00 or 2024-01-01)"
+        )
+
+
 @router.post("/queues", response_model=AnnotationQueueResponse)
 async def create_queue(
     request: AnnotationQueueCreate,
@@ -235,10 +250,10 @@ async def get_consistency_report(
 @router.get("/queues/{queue_id}/annotators", response_model=list[AnnotatorPerformanceResponse])
 async def get_queue_annotator_performances(
     queue_id: int,
-    start_time: Optional[datetime] = Query(None, description="Start time for filtering (ISO format)"),
-    end_time: Optional[datetime] = Query(None, description="End time for filtering (ISO format)"),
-    start_date: Optional[datetime] = Query(None, description="Alias for start_time", include_in_schema=False),
-    end_date: Optional[datetime] = Query(None, description="Alias for end_time", include_in_schema=False),
+    start_time: Optional[str] = Query(None, description="Start time for filtering (ISO 8601 format, e.g. 2024-01-01T00:00:00 or 2024-01-01)"),
+    end_time: Optional[str] = Query(None, description="End time for filtering (ISO 8601 format)"),
+    start_date: Optional[str] = Query(None, description="Alias for start_time", include_in_schema=False),
+    end_date: Optional[str] = Query(None, description="Alias for end_time", include_in_schema=False),
     session: AsyncSession = Depends(get_session),
 ):
     stmt = select(AnnotationQueue).where(AnnotationQueue.id == queue_id)
@@ -247,8 +262,10 @@ async def get_queue_annotator_performances(
     if not queue:
         raise HTTPException(status_code=404, detail="Annotation queue not found")
 
-    start = start_time or start_date
-    end = end_time or end_date
+    start_str = start_time or start_date
+    end_str = end_time or end_date
+    start = _parse_datetime_param(start_str, "start_time/start_date")
+    end = _parse_datetime_param(end_str, "end_time/end_date")
 
     performances = await annotation_service.get_queue_annotator_performances(
         session, queue_id, start_time=start, end_time=end
@@ -260,14 +277,16 @@ async def get_queue_annotator_performances(
 async def get_annotator_performance(
     annotator_id: str,
     queue_id: Optional[int] = Query(None, description="Filter by queue ID"),
-    start_time: Optional[datetime] = Query(None, description="Start time for filtering (ISO format)"),
-    end_time: Optional[datetime] = Query(None, description="End time for filtering (ISO format)"),
-    start_date: Optional[datetime] = Query(None, description="Alias for start_time", include_in_schema=False),
-    end_date: Optional[datetime] = Query(None, description="Alias for end_time", include_in_schema=False),
+    start_time: Optional[str] = Query(None, description="Start time for filtering (ISO 8601 format, e.g. 2024-01-01T00:00:00 or 2024-01-01)"),
+    end_time: Optional[str] = Query(None, description="End time for filtering (ISO 8601 format)"),
+    start_date: Optional[str] = Query(None, description="Alias for start_time", include_in_schema=False),
+    end_date: Optional[str] = Query(None, description="Alias for end_time", include_in_schema=False),
     session: AsyncSession = Depends(get_session),
 ):
-    start = start_time or start_date
-    end = end_time or end_date
+    start_str = start_time or start_date
+    end_str = end_time or end_date
+    start = _parse_datetime_param(start_str, "start_time/start_date")
+    end = _parse_datetime_param(end_str, "end_time/end_date")
 
     performance = await annotation_service.get_annotator_performance(
         session, annotator_id, queue_id=queue_id,
