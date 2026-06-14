@@ -23,28 +23,39 @@ def compute_uncertainty_score(sample: Sample) -> float:
     scores = []
 
     if sample.label_confidence is not None:
-        if 0.5 <= sample.label_confidence <= 0.8:
-            scores.append(1.0 - abs(0.65 - sample.label_confidence) / 0.3)
-        elif sample.label_confidence < 0.5:
+        if sample.label_confidence < 0.5:
             scores.append(1.0)
+        elif sample.label_confidence <= 0.8:
+            scores.append(1.0 - abs(0.65 - sample.label_confidence) / 0.3)
         else:
-            scores.append(0.0)
+            scores.append(max(0.1, 1.0 - (sample.label_confidence - 0.8) / 0.2))
+    else:
+        if sample.source and sample.source.value != "original":
+            scores.append(0.6)
+        else:
+            scores.append(0.3)
 
     if sample.is_filtered and sample.filter_reason:
         scores.append(0.8)
 
     if sample.similarity_score is not None:
         if sample.similarity_score < 0.7:
-            scores.append(0.7)
+            scores.append(0.8)
         else:
-            scores.append(max(0.0, (0.85 - sample.similarity_score) / 0.3))
+            scores.append(max(0.1, (0.85 - sample.similarity_score) / 0.3))
+    elif sample.source and sample.source.value != "original":
+        scores.append(0.4)
 
     if sample.perplexity is not None:
-        scores.append(min(1.0, sample.perplexity / 50.0))
+        if sample.perplexity > 50:
+            scores.append(0.8)
+        else:
+            scores.append(min(0.5, sample.perplexity / 100.0))
 
     if not scores:
-        return 0.0
-    return sum(scores) / len(scores)
+        return 0.3
+
+    return round(sum(scores) / len(scores), 4)
 
 
 async def check_version_for_annotation(
@@ -105,8 +116,7 @@ async def select_uncertain_samples(
     scored = []
     for s in all_samples:
         score = compute_uncertainty_score(s)
-        if score > 0.0 or s.is_filtered or (s.label_confidence is not None and 0.5 <= s.label_confidence <= 0.8):
-            scored.append((s, score))
+        scored.append((s, score))
 
     scored.sort(key=lambda x: x[1], reverse=True)
     return scored[:capacity]
@@ -156,6 +166,10 @@ async def create_annotation_queue(
         session.add(item)
 
     queue.capacity = len(selected)
+    if len(selected) == 0:
+        queue.status = QueueStatus.completed
+        queue.completed_at = datetime.utcnow()
+
     await session.commit()
     await session.refresh(queue)
 
@@ -678,13 +692,18 @@ async def apply_queue_results(
     if queue.status == QueueStatus.applied:
         raise ValueError(f"Queue already applied. Target version ID: {queue.target_version_id}")
 
-    if queue.status != QueueStatus.completed:
-        progress = await get_queue_progress(session, queue_id)
-        remaining = progress.pending + progress.locked + progress.disputed
+    progress = await get_queue_progress(session, queue_id)
+    remaining = progress.pending + progress.locked + progress.disputed
+
+    if remaining > 0:
         raise ValueError(
             f"Queue not fully completed. Remaining unprocessed: {remaining} "
             f"(pending: {progress.pending}, locked: {progress.locked}, disputed: {progress.disputed})"
         )
+
+    if queue.status not in (QueueStatus.completed, QueueStatus.closed):
+        queue.status = QueueStatus.completed
+        queue.completed_at = queue.completed_at or datetime.utcnow()
 
     version_stmt = select(DatasetVersion).where(DatasetVersion.id == queue.version_id)
     version_result = await session.execute(version_stmt)
