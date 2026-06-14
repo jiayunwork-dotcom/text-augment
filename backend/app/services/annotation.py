@@ -962,36 +962,130 @@ FILTER_REASON_TO_PARAM = {
 async def _analyze_filter_reason_stats(
     session: AsyncSession,
     queue_id: int,
+    augmented_version_id: Optional[int] = None,
 ) -> dict[str, dict]:
-    stmt = (
-        select(
-            Sample.filter_reason,
-            func.count(AnnotationItem.id),
-            func.sum(
-                case(
-                    (AnnotationItem.final_decision == AnnotationDecision.confirm, 1),
-                    else_=0,
-                )
-            ),
-            func.sum(
-                case(
-                    (AnnotationItem.final_decision == AnnotationDecision.discard, 1),
-                    else_=0,
-                )
-            ),
-            func.sum(
-                case(
-                    (AnnotationItem.final_decision == AnnotationDecision.relabel, 1),
-                    else_=0,
-                )
-            ),
+    if augmented_version_id is None:
+        queue_stmt = select(AnnotationQueue).where(AnnotationQueue.id == queue_id)
+        queue_result = await session.execute(queue_stmt)
+        queue = queue_result.scalar_one_or_none()
+        if not queue:
+            return {}
+
+        source_version_stmt = select(DatasetVersion).where(
+            DatasetVersion.id == queue.version_id
         )
-        .select_from(AnnotationItem)
+        source_version_result = await session.execute(source_version_stmt)
+        source_version = source_version_result.scalar_one_or_none()
+        if source_version and source_version.parent_version_id:
+            augmented_version_id = source_version.parent_version_id
+
+    if augmented_version_id is None:
+        logger.warning(
+            f"Cannot determine augmented version for queue {queue_id}, "
+            f"filter reason stats will be unavailable"
+        )
+        return {}
+
+    items_stmt = (
+        select(AnnotationItem, Sample)
         .join(Sample, AnnotationItem.sample_id == Sample.id)
         .where(
             and_(
                 AnnotationItem.queue_id == queue_id,
-                Sample.is_filtered == True,
+                AnnotationItem.status.in_([
+                    AnnotationStatus.annotated,
+                    AnnotationStatus.arbitrated,
+                ]),
+            )
+        )
+    )
+    items_result = await session.execute(items_stmt)
+    annotated_items = items_result.all()
+
+    if not annotated_items:
+        logger.info(f"No annotated items found for queue {queue_id}")
+        return {}
+
+    filtered_sample_ids = []
+    sample_to_item = {}
+    for item, filtered_sample in annotated_items:
+        aug_sample_id = filtered_sample.source_sample_id or filtered_sample.id
+        filtered_sample_ids.append(aug_sample_id)
+        sample_to_item[aug_sample_id] = item
+
+    if not filtered_sample_ids:
+        return {}
+
+    aug_samples_stmt = select(Sample).where(
+        and_(
+            Sample.id.in_(filtered_sample_ids),
+            Sample.version_id == augmented_version_id,
+            Sample.is_filtered == True,
+            Sample.filter_reason.isnot(None),
+        )
+    )
+    aug_samples_result = await session.execute(aug_samples_stmt)
+    aug_samples = aug_samples_result.scalars().all()
+
+    if not aug_samples:
+        logger.info(
+            f"No filtered samples found in augmented version {augmented_version_id} "
+            f"for queue {queue_id}. Trying fallback to source version filter_reason..."
+        )
+        return await _analyze_filter_reason_stats_fallback(session, queue_id)
+
+    filter_reason_counts = defaultdict(lambda: {
+        "total": 0, "confirm_count": 0, "discard_count": 0, "relabel_count": 0
+    })
+
+    for aug_sample in aug_samples:
+        item = sample_to_item.get(aug_sample.id)
+        if not item:
+            continue
+
+        reason = aug_sample.filter_reason
+        if not reason:
+            continue
+
+        filter_reason_counts[reason]["total"] += 1
+        if item.final_decision == AnnotationDecision.confirm:
+            filter_reason_counts[reason]["confirm_count"] += 1
+        elif item.final_decision == AnnotationDecision.discard:
+            filter_reason_counts[reason]["discard_count"] += 1
+        elif item.final_decision == AnnotationDecision.relabel:
+            filter_reason_counts[reason]["relabel_count"] += 1
+
+    stats = {}
+    for reason, counts in filter_reason_counts.items():
+        total = counts["total"]
+        if total == 0:
+            continue
+        confirm_rate = counts["confirm_count"] / total
+        discard_rate = counts["discard_count"] / total
+        relabel_rate = counts["relabel_count"] / total
+        stats[reason] = {
+            "total": total,
+            "confirm_count": counts["confirm_count"],
+            "discard_count": counts["discard_count"],
+            "relabel_count": counts["relabel_count"],
+            "confirm_rate": round(confirm_rate, 4),
+            "discard_rate": round(discard_rate, 4),
+            "relabel_rate": round(relabel_rate, 4),
+        }
+
+    return stats
+
+
+async def _analyze_filter_reason_stats_fallback(
+    session: AsyncSession,
+    queue_id: int,
+) -> dict[str, dict]:
+    items_stmt = (
+        select(AnnotationItem, Sample)
+        .join(Sample, AnnotationItem.sample_id == Sample.id)
+        .where(
+            and_(
+                AnnotationItem.queue_id == queue_id,
                 Sample.filter_reason.isnot(None),
                 AnnotationItem.status.in_([
                     AnnotationStatus.annotated,
@@ -999,29 +1093,50 @@ async def _analyze_filter_reason_stats(
                 ]),
             )
         )
-        .group_by(Sample.filter_reason)
     )
+    items_result = await session.execute(items_stmt)
+    annotated_items = items_result.all()
 
-    result = await session.execute(stmt)
-    rows = result.all()
+    if not annotated_items:
+        logger.info(f"No annotated items with filter_reason found for queue {queue_id}")
+        return {}
+
+    filter_reason_counts = defaultdict(lambda: {
+        "total": 0, "confirm_count": 0, "discard_count": 0, "relabel_count": 0
+    })
+
+    for item, sample in annotated_items:
+        reason = sample.filter_reason
+        if not reason:
+            continue
+
+        filter_reason_counts[reason]["total"] += 1
+        if item.final_decision == AnnotationDecision.confirm:
+            filter_reason_counts[reason]["confirm_count"] += 1
+        elif item.final_decision == AnnotationDecision.discard:
+            filter_reason_counts[reason]["discard_count"] += 1
+        elif item.final_decision == AnnotationDecision.relabel:
+            filter_reason_counts[reason]["relabel_count"] += 1
 
     stats = {}
-    for filter_reason, total, confirms, discards, relabels in rows:
-        if not filter_reason:
+    for reason, counts in filter_reason_counts.items():
+        total = counts["total"]
+        if total == 0:
             continue
-        confirm_rate = confirms / total if total > 0 else 0.0
-        discard_rate = discards / total if total > 0 else 0.0
-        relabel_rate = relabels / total if total > 0 else 0.0
-        stats[filter_reason] = {
+        confirm_rate = counts["confirm_count"] / total
+        discard_rate = counts["discard_count"] / total
+        relabel_rate = counts["relabel_count"] / total
+        stats[reason] = {
             "total": total,
-            "confirm_count": confirms,
-            "discard_count": discards,
-            "relabel_count": relabels,
+            "confirm_count": counts["confirm_count"],
+            "discard_count": counts["discard_count"],
+            "relabel_count": counts["relabel_count"],
             "confirm_rate": round(confirm_rate, 4),
             "discard_rate": round(discard_rate, 4),
             "relabel_rate": round(relabel_rate, 4),
         }
 
+    logger.info(f"Fallback stats for queue {queue_id}: {len(stats)} filter reasons found")
     return stats
 
 
@@ -1305,10 +1420,12 @@ async def get_annotator_performance(
         stmt = stmt.join(AnnotationItem, AnnotationRecord.item_id == AnnotationItem.id)
         stmt = stmt.where(AnnotationItem.queue_id == queue_id)
 
-    if start_time:
-        stmt = stmt.where(AnnotationRecord.submitted_at >= start_time)
-    if end_time:
-        stmt = stmt.where(AnnotationRecord.submitted_at <= end_time)
+    if start_time or end_time:
+        time_field = func.coalesce(AnnotationRecord.submitted_at, AnnotationRecord.created_at)
+        if start_time:
+            stmt = stmt.where(time_field >= start_time)
+        if end_time:
+            stmt = stmt.where(time_field <= end_time)
 
     result = await session.execute(stmt)
     records = result.scalars().all()
@@ -1363,8 +1480,16 @@ async def get_queue_annotator_performances(
         select(AnnotationRecord.annotator_id)
         .join(AnnotationItem, AnnotationRecord.item_id == AnnotationItem.id)
         .where(AnnotationItem.queue_id == queue_id)
-        .distinct()
     )
+
+    if start_time or end_time:
+        time_field = func.coalesce(AnnotationRecord.submitted_at, AnnotationRecord.created_at)
+        if start_time:
+            stmt = stmt.where(time_field >= start_time)
+        if end_time:
+            stmt = stmt.where(time_field <= end_time)
+
+    stmt = stmt.distinct()
     result = await session.execute(stmt)
     annotator_ids = [row[0] for row in result.all()]
 
@@ -1374,7 +1499,8 @@ async def get_queue_annotator_performances(
             session, aid, queue_id=queue_id,
             start_time=start_time, end_time=end_time
         )
-        performances.append(perf)
+        if perf.total_annotated > 0:
+            performances.append(perf)
 
     performances.sort(key=lambda x: x.total_annotated, reverse=True)
     return performances

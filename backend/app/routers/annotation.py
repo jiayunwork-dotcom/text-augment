@@ -237,6 +237,8 @@ async def get_queue_annotator_performances(
     queue_id: int,
     start_time: Optional[datetime] = Query(None, description="Start time for filtering (ISO format)"),
     end_time: Optional[datetime] = Query(None, description="End time for filtering (ISO format)"),
+    start_date: Optional[datetime] = Query(None, description="Alias for start_time", include_in_schema=False),
+    end_date: Optional[datetime] = Query(None, description="Alias for end_time", include_in_schema=False),
     session: AsyncSession = Depends(get_session),
 ):
     stmt = select(AnnotationQueue).where(AnnotationQueue.id == queue_id)
@@ -245,8 +247,11 @@ async def get_queue_annotator_performances(
     if not queue:
         raise HTTPException(status_code=404, detail="Annotation queue not found")
 
+    start = start_time or start_date
+    end = end_time or end_date
+
     performances = await annotation_service.get_queue_annotator_performances(
-        session, queue_id, start_time=start_time, end_time=end_time
+        session, queue_id, start_time=start, end_time=end
     )
     return performances
 
@@ -257,11 +262,16 @@ async def get_annotator_performance(
     queue_id: Optional[int] = Query(None, description="Filter by queue ID"),
     start_time: Optional[datetime] = Query(None, description="Start time for filtering (ISO format)"),
     end_time: Optional[datetime] = Query(None, description="End time for filtering (ISO format)"),
+    start_date: Optional[datetime] = Query(None, description="Alias for start_time", include_in_schema=False),
+    end_date: Optional[datetime] = Query(None, description="Alias for end_time", include_in_schema=False),
     session: AsyncSession = Depends(get_session),
 ):
+    start = start_time or start_date
+    end = end_time or end_date
+
     performance = await annotation_service.get_annotator_performance(
         session, annotator_id, queue_id=queue_id,
-        start_time=start_time, end_time=end_time
+        start_time=start, end_time=end
     )
     if performance.total_annotated == 0 and queue_id is not None:
         stmt = select(AnnotationQueue).where(AnnotationQueue.id == queue_id)
