@@ -962,34 +962,28 @@ FILTER_REASON_TO_PARAM = {
 async def _analyze_filter_reason_stats(
     session: AsyncSession,
     queue_id: int,
-    augmented_version_id: Optional[int] = None,
 ) -> dict[str, dict]:
     logger.info(f"[FilterStats] Starting analysis for queue {queue_id}")
 
-    if augmented_version_id is None:
-        queue_stmt = select(AnnotationQueue).where(AnnotationQueue.id == queue_id)
-        queue_result = await session.execute(queue_stmt)
-        queue = queue_result.scalar_one_or_none()
-        if not queue:
-            logger.warning(f"[FilterStats] Queue {queue_id} not found")
-            return {}
-
-        source_version_stmt = select(DatasetVersion).where(
-            DatasetVersion.id == queue.version_id
-        )
-        source_version_result = await session.execute(source_version_stmt)
-        source_version = source_version_result.scalar_one_or_none()
-        if source_version and source_version.parent_version_id:
-            augmented_version_id = source_version.parent_version_id
-            logger.info(f"[FilterStats] Using augmented version_id={augmented_version_id} "
-                        f"(from source version parent)")
-        elif source_version:
-            augmented_version_id = queue.version_id
-            logger.info(f"[FilterStats] No parent version, using queue's source version_id={augmented_version_id} as fallback")
-
-    if augmented_version_id is None:
-        logger.warning(f"[FilterStats] Cannot determine version for queue {queue_id}")
+    queue_stmt = select(AnnotationQueue).where(AnnotationQueue.id == queue_id)
+    queue_result = await session.execute(queue_stmt)
+    queue = queue_result.scalar_one_or_none()
+    if not queue:
+        logger.warning(f"[FilterStats] Queue {queue_id} not found")
         return {}
+
+    source_version_stmt = select(DatasetVersion).where(
+        DatasetVersion.id == queue.version_id
+    )
+    source_version_result = await session.execute(source_version_stmt)
+    source_version = source_version_result.scalar_one_or_none()
+
+    if not source_version:
+        logger.warning(f"[FilterStats] Source version {queue.version_id} not found")
+        return {}
+
+    logger.info(f"[FilterStats] Source version: type={source_version.version_type}, "
+                f"parent_id={source_version.parent_version_id}")
 
     finalized_stmt = (
         select(AnnotationItem, Sample)
@@ -1012,50 +1006,52 @@ async def _analyze_filter_reason_stats(
     if not finalized_items:
         return {}
 
-    filtered_sample_to_source: dict[int, AnnotationItem] = {}
-    aug_sample_ids = []
-
-    for item, filtered_sample in finalized_items:
-        aug_sample_id = filtered_sample.source_sample_id
-        if aug_sample_id is None:
-            aug_sample_id = filtered_sample.id
-            logger.debug(f"[FilterStats] sample {filtered_sample.id} has no source_sample_id, "
-                        f"using own id={aug_sample_id}")
-
-        aug_sample_ids.append(aug_sample_id)
-        filtered_sample_to_source[aug_sample_id] = item
-
-    logger.info(f"[FilterStats] Looking up {len(aug_sample_ids)} samples in version {augmented_version_id} "
-                f"with is_filtered=True and filter_reason IS NOT NULL")
-
-    aug_samples_stmt = select(Sample).where(
-        and_(
-            Sample.id.in_(aug_sample_ids),
-            Sample.version_id == augmented_version_id,
-        )
+    stats = await _analyze_filter_reason_from_samples(
+        session, finalized_items, source_version
     )
-    aug_samples_result = await session.execute(aug_samples_stmt)
-    all_aug_samples = aug_samples_result.scalars().all()
 
-    logger.info(f"[FilterStats] Found {len(all_aug_samples)} samples in aug version "
-                f"(is_filtered=True and filter_reason: "
-                f"{sum(1 for s in all_aug_samples if s.is_filtered and s.filter_reason)})")
+    if stats:
+        logger.info(f"[FilterStats] Got {len(stats)} filter reasons from direct analysis")
+        return stats
 
+    logger.info(f"[FilterStats] No filter reasons from direct analysis, trying parent version...")
+
+    if source_version.parent_version_id:
+        parent_stmt = select(DatasetVersion).where(
+            DatasetVersion.id == source_version.parent_version_id
+        )
+        parent_result = await session.execute(parent_stmt)
+        parent_version = parent_result.scalar_one_or_none()
+        if parent_version:
+            logger.info(f"[FilterStats] Parent version: id={parent_version.id}, "
+                        f"type={parent_version.version_type}")
+            stats = await _analyze_filter_reason_from_parent(
+                session, finalized_items, source_version, parent_version
+            )
+            if stats:
+                logger.info(f"[FilterStats] Got {len(stats)} filter reasons from parent version")
+                return stats
+
+    logger.info(f"[FilterStats] Could not find any filter reason data")
+    return {}
+
+
+async def _analyze_filter_reason_from_samples(
+    session: AsyncSession,
+    finalized_items: list,
+    source_version: DatasetVersion,
+) -> dict[str, dict]:
     filter_reason_counts = defaultdict(lambda: {
         "total": 0, "confirm_count": 0, "discard_count": 0, "relabel_count": 0
     })
 
-    matched_count = 0
-    for aug_sample in all_aug_samples:
-        if not aug_sample.is_filtered or not aug_sample.filter_reason:
+    samples_with_reason = 0
+    for item, sample in finalized_items:
+        reason = sample.filter_reason
+        if not reason:
             continue
 
-        item = filtered_sample_to_source.get(aug_sample.id)
-        if not item:
-            continue
-
-        matched_count += 1
-        reason = aug_sample.filter_reason
+        samples_with_reason += 1
         filter_reason_counts[reason]["total"] += 1
         if item.final_decision == AnnotationDecision.confirm:
             filter_reason_counts[reason]["confirm_count"] += 1
@@ -1064,25 +1060,12 @@ async def _analyze_filter_reason_stats(
         elif item.final_decision == AnnotationDecision.relabel:
             filter_reason_counts[reason]["relabel_count"] += 1
 
-    logger.info(f"[FilterStats] Matched {matched_count} samples with filter reasons from aug version")
+    if samples_with_reason == 0:
+        logger.info(f"[FilterStats] No samples have filter_reason in source version "
+                    f"(type={source_version.version_type})")
+        return {}
 
-    if matched_count == 0:
-        logger.info(f"[FilterStats] Trying fallback: checking filter_reason in queue source version samples")
-        for item, filtered_sample in finalized_items:
-            reason = filtered_sample.filter_reason
-            if not reason:
-                continue
-            item_obj = item
-            filter_reason_counts[reason]["total"] += 1
-            if item_obj.final_decision == AnnotationDecision.confirm:
-                filter_reason_counts[reason]["confirm_count"] += 1
-            elif item_obj.final_decision == AnnotationDecision.discard:
-                filter_reason_counts[reason]["discard_count"] += 1
-            elif item_obj.final_decision == AnnotationDecision.relabel:
-                filter_reason_counts[reason]["relabel_count"] += 1
-
-        matched_count = sum(c["total"] for c in filter_reason_counts.values())
-        logger.info(f"[FilterStats] Fallback found {matched_count} samples with filter reasons")
+    logger.info(f"[FilterStats] {samples_with_reason}/{len(finalized_items)} samples have filter_reason")
 
     stats = {}
     for reason, counts in filter_reason_counts.items():
@@ -1102,7 +1085,112 @@ async def _analyze_filter_reason_stats(
             "relabel_rate": round(relabel_rate, 4),
         }
 
-    logger.info(f"[FilterStats] Final result: {len(stats)} filter reasons with data: {stats}")
+    return stats
+
+
+async def _analyze_filter_reason_from_parent(
+    session: AsyncSession,
+    finalized_items: list,
+    source_version: DatasetVersion,
+    parent_version: DatasetVersion,
+) -> dict[str, dict]:
+    sample_ids_in_queue = [item.sample_id for item, _ in finalized_items]
+    item_by_sample_id = {item.sample_id: item for item, _ in finalized_items}
+
+    source_samples_stmt = select(Sample).where(
+        and_(
+            Sample.id.in_(sample_ids_in_queue),
+            Sample.version_id == source_version.id,
+        )
+    )
+    source_samples_result = await session.execute(source_samples_stmt)
+    source_samples = source_samples_result.scalars().all()
+
+    source_sample_map = {s.id: s for s in source_samples}
+
+    aug_source_ids = []
+    for s in source_samples:
+        if s.source_sample_id:
+            aug_source_ids.append(s.source_sample_id)
+
+    logger.info(f"[FilterStats] Trying to find {len(aug_source_ids)} parent samples "
+                f"in version {parent_version.id} by source_sample_id matching...")
+
+    if not aug_source_ids:
+        logger.info(f"[FilterStats] No source_sample_id references found")
+        return {}
+
+    parent_samples_stmt = select(Sample).where(
+        and_(
+            Sample.id.in_(aug_source_ids),
+            Sample.version_id == parent_version.id,
+            Sample.is_filtered == True,
+            Sample.filter_reason.isnot(None),
+        )
+    )
+    parent_samples_result = await session.execute(parent_samples_stmt)
+    parent_samples = parent_samples_result.scalars().all()
+
+    logger.info(f"[FilterStats] Found {len(parent_samples)} filtered samples in parent version")
+
+    if not parent_samples:
+        return {}
+
+    parent_sample_map = {s.id: s for s in parent_samples}
+
+    filter_reason_counts = defaultdict(lambda: {
+        "total": 0, "confirm_count": 0, "discard_count": 0, "relabel_count": 0
+    })
+
+    matched = 0
+    for source_sample_id, source_sample in source_sample_map.items():
+        if not source_sample.source_sample_id:
+            continue
+
+        parent_sample = parent_sample_map.get(source_sample.source_sample_id)
+        if not parent_sample:
+            continue
+
+        item = item_by_sample_id.get(source_sample_id)
+        if not item:
+            continue
+
+        reason = parent_sample.filter_reason
+        if not reason:
+            continue
+
+        matched += 1
+        filter_reason_counts[reason]["total"] += 1
+        if item.final_decision == AnnotationDecision.confirm:
+            filter_reason_counts[reason]["confirm_count"] += 1
+        elif item.final_decision == AnnotationDecision.discard:
+            filter_reason_counts[reason]["discard_count"] += 1
+        elif item.final_decision == AnnotationDecision.relabel:
+            filter_reason_counts[reason]["relabel_count"] += 1
+
+    logger.info(f"[FilterStats] Matched {matched} samples with filter reasons via parent version")
+
+    if matched == 0:
+        return {}
+
+    stats = {}
+    for reason, counts in filter_reason_counts.items():
+        total = counts["total"]
+        if total == 0:
+            continue
+        confirm_rate = counts["confirm_count"] / total
+        discard_rate = counts["discard_count"] / total
+        relabel_rate = counts["relabel_count"] / total
+        stats[reason] = {
+            "total": total,
+            "confirm_count": counts["confirm_count"],
+            "discard_count": counts["discard_count"],
+            "relabel_count": counts["relabel_count"],
+            "confirm_rate": round(confirm_rate, 4),
+            "discard_rate": round(discard_rate, 4),
+            "relabel_rate": round(relabel_rate, 4),
+        }
+
     return stats
 
 
