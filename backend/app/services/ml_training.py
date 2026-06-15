@@ -92,9 +92,7 @@ async def create_ml_training_task(
             f"Current version type: {version.version_type}"
         )
 
-    total = split_ratios.get("train_ratio", 0) + split_ratios.get("val_ratio", 0) + split_ratios.get("test_ratio", 0)
-    if abs(total - 1.0) > 1e-6:
-        raise ValueError(f"Split ratios must sum to 1.0, got {total}")
+    _validate_split_ratios(split_ratios)
 
     task = MLTrainingTask(
         task_name=task_name,
@@ -114,10 +112,13 @@ async def create_ml_training_task(
 async def list_ml_training_tasks(
     session: AsyncSession,
     dataset_id: Optional[int] = None,
+    status: Optional[MLTrainingStatus] = None,
 ) -> list[MLTrainingTask]:
     stmt = select(MLTrainingTask).order_by(MLTrainingTask.created_at.desc())
     if dataset_id is not None:
         stmt = stmt.where(MLTrainingTask.dataset_id == dataset_id)
+    if status is not None:
+        stmt = stmt.where(MLTrainingTask.status == status)
     result = await session.execute(stmt)
     return list(result.scalars().all())
 
@@ -131,7 +132,7 @@ async def get_ml_training_task(
     return result.scalar_one_or_none()
 
 
-def _build_pipeline(model_type: MLModelType, hyperparams: dict) -> Pipeline:
+def _build_pipeline(model_type: MLModelType, hyperparams: dict, num_classes: int = 2) -> Pipeline:
     ngram_min = int(hyperparams.get("ngram_min", 1))
     ngram_max = int(hyperparams.get("ngram_max", 1))
     if ngram_min > ngram_max:
@@ -145,14 +146,57 @@ def _build_pipeline(model_type: MLModelType, hyperparams: dict) -> Pipeline:
     else:
         max_iter = int(hyperparams.get("max_iter", 100))
         C = float(hyperparams.get("C", 1.0))
-        clf = LogisticRegression(
-            C=C,
-            max_iter=max_iter,
-            solver="liblinear",
-            random_state=42,
-        )
+        if num_classes > 2:
+            clf = LogisticRegression(
+                C=C,
+                max_iter=max_iter,
+                solver="lbfgs",
+                random_state=42,
+            )
+        else:
+            clf = LogisticRegression(
+                C=C,
+                max_iter=max_iter,
+                solver="liblinear",
+                random_state=42,
+            )
 
     return Pipeline([("tfidf", vectorizer), ("clf", clf)])
+
+
+def _validate_split_ratios(split_ratios: dict) -> None:
+    if not split_ratios:
+        raise ValueError("split_ratios is required")
+
+    train_ratio = split_ratios.get("train_ratio")
+    val_ratio = split_ratios.get("val_ratio")
+    test_ratio = split_ratios.get("test_ratio")
+
+    if train_ratio is None or val_ratio is None or test_ratio is None:
+        raise ValueError("train_ratio, val_ratio and test_ratio are all required")
+
+    for name, val in (
+        ("train_ratio", train_ratio),
+        ("val_ratio", val_ratio),
+        ("test_ratio", test_ratio),
+    ):
+        if not isinstance(val, (int, float)):
+            raise ValueError(f"{name} must be a number")
+        if val <= 0:
+            raise ValueError(f"{name} must be > 0")
+        if val >= 1:
+            raise ValueError(f"{name} must be < 1")
+
+    total = float(train_ratio) + float(val_ratio) + float(test_ratio)
+    if abs(total - 1.0) > 1e-6:
+        raise ValueError(
+            f"Sum of split ratios must equal 1.0, got train={train_ratio} + val={val_ratio} + test={test_ratio} = {total}"
+        )
+
+    if float(train_ratio) < 0.2:
+        raise ValueError("train_ratio must be at least 0.2 (need enough data to train)")
+    if float(test_ratio) < 0.05:
+        raise ValueError("test_ratio must be at least 0.05 for meaningful evaluation")
 
 
 async def execute_ml_training(session: AsyncSession, task_id: int) -> None:
@@ -214,7 +258,7 @@ async def execute_ml_training(session: AsyncSession, task_id: int) -> None:
         else:
             X_val, X_test, y_val, y_test = X_val_test, [], y_val_test, np.array([], dtype=int)
 
-        pipeline = _build_pipeline(task.model_type, task.hyperparams or {})
+        pipeline = _build_pipeline(task.model_type, task.hyperparams or {}, num_classes=len(unique_labels))
         pipeline.fit(X_train, y_train)
 
         train_losses = []

@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
 
 from ..database import get_session
-from ..models.db_models import MLTrainingStatus
+from ..models.db_models import MLTrainingStatus, MLModelType
 from ..models.schemas import (
     MLTrainingTaskCreate,
     MLTrainingTaskResponse,
@@ -55,9 +55,13 @@ async def create_training_task(
 @router.get("/tasks", response_model=list[MLTrainingTaskResponse])
 async def list_training_tasks(
     dataset_id: Optional[int] = Query(None, description="Filter by dataset ID"),
+    status: Optional[MLTrainingStatus] = Query(None, description="Filter by training status (pending/training/completed/failed)"),
+    model_type: Optional[MLModelType] = Query(None, description="Filter by model type (naive_bayes/logistic_regression)"),
     session: AsyncSession = Depends(get_session),
 ):
-    tasks = await ml_service.list_ml_training_tasks(session, dataset_id=dataset_id)
+    tasks = await ml_service.list_ml_training_tasks(session, dataset_id=dataset_id, status=status)
+    if model_type is not None:
+        tasks = [t for t in tasks if t.model_type == model_type]
     return [MLTrainingTaskResponse.model_validate(t) for t in tasks]
 
 
