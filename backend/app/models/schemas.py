@@ -587,3 +587,136 @@ class ConsistencyReport(BaseModel):
     warning: Optional[str] = None
     annotator_stats: list[AnnotatorStats] = []
     pairwise_kappa: Optional[dict] = None
+
+
+class MLModelType(str, Enum):
+    naive_bayes = "naive_bayes"
+    logistic_regression = "logistic_regression"
+
+
+class MLTrainingStatus(str, Enum):
+    pending = "pending"
+    training = "training"
+    completed = "completed"
+    failed = "failed"
+
+
+class MLHyperparams(BaseModel):
+    max_iter: int = Field(default=100, ge=1, le=10000)
+    C: float = Field(default=1.0, gt=0, le=100)
+    ngram_min: int = Field(default=1, ge=1, le=5)
+    ngram_max: int = Field(default=1, ge=1, le=5)
+    alpha: float = Field(default=1.0, ge=0.0, le=10.0)
+
+
+class MLSplitRatios(BaseModel):
+    train_ratio: float = Field(default=0.7, ge=0.1, le=0.9)
+    val_ratio: float = Field(default=0.15, ge=0.05, le=0.5)
+    test_ratio: float = Field(default=0.15, ge=0.05, le=0.5)
+
+
+class MLTrainingTaskCreate(BaseModel):
+    task_name: str
+    annotated_version_id: int
+    model_type: MLModelType
+    hyperparams: MLHyperparams = MLHyperparams()
+    split_ratios: MLSplitRatios = MLSplitRatios()
+    random_seed: int = 42
+
+
+class MLTrainingTaskResponse(BaseModel):
+    id: int
+    task_name: str
+    dataset_id: int
+    annotated_version_id: int
+    model_type: MLModelType
+    hyperparams: dict
+    split_ratios: dict
+    status: MLTrainingStatus
+    train_loss_history: list
+    train_acc_history: list
+    val_loss_history: list
+    val_acc_history: list
+    model_path: Optional[str] = None
+    model_size_bytes: Optional[int] = None
+    training_duration_seconds: Optional[float] = None
+    error_message: Optional[str] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class MLTrainingReportResponse(BaseModel):
+    id: int
+    task_id: int
+    accuracy: float
+    weighted_f1: float
+    per_class_metrics: dict
+    confusion_matrix: list
+    class_names: list
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class MLModelCompareRequest(BaseModel):
+    task_ids: list[int]
+
+
+class MLModelCompareItem(BaseModel):
+    task_id: int
+    task_name: str
+    model_type: str
+    accuracy: float
+    weighted_f1: float
+    training_duration_seconds: Optional[float] = None
+    model_size_bytes: Optional[int] = None
+
+
+class MLModelCompareResponse(BaseModel):
+    dataset_id: int
+    dataset_name: str
+    items: list[MLModelCompareItem]
+
+
+class MLPredictSingleRequest(BaseModel):
+    task_id: int
+    text: str
+
+
+class MLPredictSingleResponse(BaseModel):
+    task_id: int
+    predicted_label: str
+    probabilities: dict
+
+
+class MLPredictBatchRequest(BaseModel):
+    task_id: int
+    texts: list[str] = Field(..., max_length=100)
+
+
+class MLPredictBatchItem(BaseModel):
+    text: str
+    predicted_label: str
+    probabilities: dict
+
+
+class MLPredictBatchResponse(BaseModel):
+    task_id: int
+    results: list[MLPredictBatchItem]
+
+
+class MLDataLineageNode(BaseModel):
+    node_type: str
+    id: int
+    name: str
+    info: dict
+
+
+class MLDataLineageResponse(BaseModel):
+    task_id: int
+    chain: list[MLDataLineageNode]

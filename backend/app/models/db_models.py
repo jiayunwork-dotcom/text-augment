@@ -361,3 +361,56 @@ class RecommendedFilterConfig(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     version = relationship("DatasetVersion")
+
+
+class MLModelType(str, enum.Enum):
+    naive_bayes = "naive_bayes"
+    logistic_regression = "logistic_regression"
+
+
+class MLTrainingStatus(str, enum.Enum):
+    pending = "pending"
+    training = "training"
+    completed = "completed"
+    failed = "failed"
+
+
+class MLTrainingTask(Base):
+    __tablename__ = "ml_training_tasks"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_name = Column(String(255), nullable=False)
+    dataset_id = Column(Integer, ForeignKey("datasets.id", ondelete="CASCADE"), nullable=False)
+    annotated_version_id = Column(Integer, ForeignKey("dataset_versions.id"), nullable=False)
+    model_type = Column(Enum(MLModelType), nullable=False)
+    hyperparams = Column(JSON, default=dict)
+    split_ratios = Column(JSON, default=dict)
+    status = Column(Enum(MLTrainingStatus), default=MLTrainingStatus.pending)
+    train_loss_history = Column(JSON, default=list)
+    train_acc_history = Column(JSON, default=list)
+    val_loss_history = Column(JSON, default=list)
+    val_acc_history = Column(JSON, default=list)
+    model_path = Column(String(500), nullable=True)
+    model_size_bytes = Column(Integer, nullable=True)
+    training_duration_seconds = Column(Float, nullable=True)
+    error_message = Column(Text, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    annotated_version = relationship("DatasetVersion", foreign_keys=[annotated_version_id])
+
+
+class MLTrainingReport(Base):
+    __tablename__ = "ml_training_reports"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(Integer, ForeignKey("ml_training_tasks.id", ondelete="CASCADE"), nullable=False, unique=True)
+    accuracy = Column(Float, default=0.0)
+    weighted_f1 = Column(Float, default=0.0)
+    per_class_metrics = Column(JSON, default=dict)
+    confusion_matrix = Column(JSON, default=list)
+    class_names = Column(JSON, default=list)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    task = relationship("MLTrainingTask")

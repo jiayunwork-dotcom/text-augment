@@ -207,6 +207,56 @@ def main():
         else:
             print("  recommended_filter_configs table already exists.")
 
+        if "ml_training_tasks" not in existing_tables:
+            print("Creating ml_training_tasks table...")
+            conn.execute(text("""
+                CREATE TABLE ml_training_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_name VARCHAR(255) NOT NULL,
+                    dataset_id INTEGER NOT NULL,
+                    annotated_version_id INTEGER NOT NULL,
+                    model_type VARCHAR(50) NOT NULL,
+                    hyperparams TEXT DEFAULT '{}',
+                    split_ratios TEXT DEFAULT '{}',
+                    status VARCHAR(20) DEFAULT 'pending',
+                    train_loss_history TEXT DEFAULT '[]',
+                    train_acc_history TEXT DEFAULT '[]',
+                    val_loss_history TEXT DEFAULT '[]',
+                    val_acc_history TEXT DEFAULT '[]',
+                    model_path VARCHAR(500),
+                    model_size_bytes INTEGER,
+                    training_duration_seconds FLOAT,
+                    error_message TEXT,
+                    started_at DATETIME,
+                    completed_at DATETIME,
+                    created_at DATETIME,
+                    FOREIGN KEY (dataset_id) REFERENCES datasets(id) ON DELETE CASCADE,
+                    FOREIGN KEY (annotated_version_id) REFERENCES dataset_versions(id)
+                )
+            """))
+            print("  ml_training_tasks table created.")
+        else:
+            print("  ml_training_tasks table already exists.")
+
+        if "ml_training_reports" not in existing_tables:
+            print("Creating ml_training_reports table...")
+            conn.execute(text("""
+                CREATE TABLE ml_training_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER NOT NULL UNIQUE,
+                    accuracy FLOAT DEFAULT 0.0,
+                    weighted_f1 FLOAT DEFAULT 0.0,
+                    per_class_metrics TEXT DEFAULT '{}',
+                    confusion_matrix TEXT DEFAULT '[]',
+                    class_names TEXT DEFAULT '[]',
+                    created_at DATETIME,
+                    FOREIGN KEY (task_id) REFERENCES ml_training_tasks(id) ON DELETE CASCADE
+                )
+            """))
+            print("  ml_training_reports table created.")
+        else:
+            print("  ml_training_reports table already exists.")
+
     print("Migration completed successfully!")
 
 
