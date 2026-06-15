@@ -19,6 +19,7 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
     log_loss,
+    roc_auc_score,
 )
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -79,6 +80,8 @@ async def create_ml_training_task(
     model_type: MLModelType,
     hyperparams: dict,
     split_ratios: dict,
+    notes: Optional[str] = None,
+    tags: Optional[list[str]] = None,
 ) -> MLTrainingTask:
     version_stmt = select(DatasetVersion).where(DatasetVersion.id == annotated_version_id)
     version_result = await session.execute(version_stmt)
@@ -94,6 +97,8 @@ async def create_ml_training_task(
 
     _validate_split_ratios(split_ratios)
 
+    validated_tags = _validate_tags(tags) if tags else []
+
     task = MLTrainingTask(
         task_name=task_name,
         dataset_id=version.dataset_id,
@@ -102,6 +107,8 @@ async def create_ml_training_task(
         hyperparams=hyperparams,
         split_ratios=split_ratios,
         status=MLTrainingStatus.pending,
+        notes=notes,
+        tags=validated_tags,
     )
     session.add(task)
     await session.commit()
@@ -113,6 +120,7 @@ async def list_ml_training_tasks(
     session: AsyncSession,
     dataset_id: Optional[int] = None,
     status: Optional[MLTrainingStatus] = None,
+    tag: Optional[str] = None,
 ) -> list[MLTrainingTask]:
     stmt = select(MLTrainingTask).order_by(MLTrainingTask.created_at.desc())
     if dataset_id is not None:
@@ -120,7 +128,10 @@ async def list_ml_training_tasks(
     if status is not None:
         stmt = stmt.where(MLTrainingTask.status == status)
     result = await session.execute(stmt)
-    return list(result.scalars().all())
+    tasks = list(result.scalars().all())
+    if tag is not None:
+        tasks = [t for t in tasks if t.tags and tag in t.tags]
+    return tasks
 
 
 async def get_ml_training_task(
@@ -199,11 +210,23 @@ def _validate_split_ratios(split_ratios: dict) -> None:
         raise ValueError("test_ratio must be at least 0.05 for meaningful evaluation")
 
 
+def _validate_tags(tags: list[str]) -> list[str]:
+    if len(tags) > 10:
+        raise ValueError("Maximum 10 tags allowed")
+    for t in tags:
+        if len(t) > 30:
+            raise ValueError(f"Tag '{t[:10]}...' exceeds 30 character limit")
+    return tags
+
+
 async def execute_ml_training(session: AsyncSession, task_id: int) -> None:
     stmt = select(MLTrainingTask).where(MLTrainingTask.id == task_id)
     result = await session.execute(stmt)
     task = result.scalar_one_or_none()
     if not task:
+        return
+
+    if task.status == MLTrainingStatus.cancelled:
         return
 
     if task.status != MLTrainingStatus.pending:
@@ -307,6 +330,7 @@ async def execute_ml_training(session: AsyncSession, task_id: int) -> None:
 
         if len(X_test) > 0:
             test_pred = pipeline.predict(X_test)
+            test_proba = pipeline.predict_proba(X_test)
             test_pred_labels = [id_to_label[int(p)] for p in test_pred]
             y_test_labels = [id_to_label[int(p)] for p in y_test]
 
@@ -317,18 +341,41 @@ async def execute_ml_training(session: AsyncSession, task_id: int) -> None:
                 y_test_labels, test_pred_labels, output_dict=True, zero_division=0
             )
             per_class = {}
+            total_support = sum(
+                int(metrics.get("support", 0))
+                for key, metrics in report.items()
+                if key not in ("accuracy", "macro avg", "weighted avg")
+            )
+            pred_counter = Counter(test_pred_labels)
+            actual_counter = Counter(y_test_labels)
+
             for key, metrics in report.items():
                 if key in ("accuracy", "macro avg", "weighted avg"):
                     continue
+                support_val = int(metrics.get("support", 0))
+                support_ratio = support_val / total_support if total_support > 0 else 0.0
+                actual_count = actual_counter.get(key, 0)
+                pred_count = pred_counter.get(key, 0)
+                prediction_bias = pred_count / actual_count if actual_count > 0 else None
+
                 per_class[key] = {
                     "precision": float(metrics.get("precision", 0.0)),
                     "recall": float(metrics.get("recall", 0.0)),
                     "f1-score": float(metrics.get("f1-score", 0.0)),
-                    "support": int(metrics.get("support", 0)),
+                    "support": support_val,
+                    "support_ratio": round(support_ratio, 6),
+                    "prediction_bias": round(prediction_bias, 6) if prediction_bias is not None else None,
                 }
 
             cm = confusion_matrix(y_test_labels, test_pred_labels, labels=unique_labels)
             confusion_matrix_list = cm.tolist()
+
+            roc_auc = None
+            if len(unique_labels) == 2:
+                try:
+                    roc_auc = float(roc_auc_score(y_test, test_proba[:, 1]))
+                except Exception:
+                    roc_auc = None
 
             report_row = MLTrainingReport(
                 task_id=task.id,
@@ -337,10 +384,18 @@ async def execute_ml_training(session: AsyncSession, task_id: int) -> None:
                 per_class_metrics=per_class,
                 confusion_matrix=confusion_matrix_list,
                 class_names=unique_labels,
+                roc_auc=roc_auc,
             )
             session.add(report_row)
 
         duration = time.time() - start_time
+
+        cancelled_stmt = select(MLTrainingTask).where(MLTrainingTask.id == task_id)
+        cancelled_result = await session.execute(cancelled_stmt)
+        refreshed_task = cancelled_result.scalar_one_or_none()
+        if refreshed_task and refreshed_task.status == MLTrainingStatus.cancelled:
+            await session.commit()
+            return
 
         task.status = MLTrainingStatus.completed
         task.model_path = str(model_path)
@@ -372,7 +427,24 @@ async def get_ml_training_report(
 ) -> Optional[MLTrainingReport]:
     stmt = select(MLTrainingReport).where(MLTrainingReport.task_id == task_id)
     result = await session.execute(stmt)
-    return result.scalar_one_or_none()
+    report = result.scalar_one_or_none()
+    if not report:
+        return None
+
+    per_class = report.per_class_metrics or {}
+    enriched = {}
+    for class_name, metrics in per_class.items():
+        enriched[class_name] = {
+            "precision": metrics.get("precision", 0.0),
+            "recall": metrics.get("recall", 0.0),
+            "f1-score": metrics.get("f1-score", 0.0),
+            "support": metrics.get("support", 0),
+            "support_ratio": metrics.get("support_ratio"),
+            "prediction_bias": metrics.get("prediction_bias"),
+        }
+    report.per_class_metrics = enriched
+
+    return report
 
 
 async def compare_ml_models(
@@ -414,6 +486,7 @@ async def compare_ml_models(
     for tid in task_ids:
         task = tasks[tid]
         report = reports.get(tid)
+        per_class = report.per_class_metrics if report else {}
         items.append({
             "task_id": task.id,
             "task_name": task.task_name,
@@ -422,13 +495,123 @@ async def compare_ml_models(
             "weighted_f1": report.weighted_f1 if report else 0.0,
             "training_duration_seconds": task.training_duration_seconds,
             "model_size_bytes": task.model_size_bytes,
+            "per_class_metrics": per_class,
         })
+
+    delta_summary = None
+    if len(items) >= 2:
+        best_task_id = None
+        best_metrics = []
+        best_score = -1.0
+
+        metric_keys = ["accuracy", "weighted_f1"]
+        for item in items:
+            score = sum(item.get(k, 0.0) for k in metric_keys)
+            if score > best_score:
+                best_score = score
+                best_task_id = item["task_id"]
+
+        if best_task_id is not None:
+            best_item = next(i for i in items if i["task_id"] == best_task_id)
+            for key in metric_keys:
+                best_val = best_item.get(key, 0.0)
+                is_best = all(i.get(key, 0.0) <= best_val for i in items if i["task_id"] != best_task_id)
+                if is_best:
+                    best_metrics.append(f"{key}_best")
+
+            delta_summary = {
+                "best_task_id": best_task_id,
+                "best_metrics": best_metrics,
+            }
+    elif len(items) == 1:
+        delta_summary = None
 
     return {
         "dataset_id": dataset_id,
         "dataset_name": dataset_name,
         "items": items,
+        "delta_summary": delta_summary,
     }
+
+
+async def cancel_ml_training_task(
+    session: AsyncSession,
+    task_id: int,
+) -> MLTrainingTask:
+    stmt = select(MLTrainingTask).where(MLTrainingTask.id == task_id)
+    result = await session.execute(stmt)
+    task = result.scalar_one_or_none()
+    if not task:
+        raise ValueError(f"Training task {task_id} not found")
+    if task.status not in (MLTrainingStatus.pending, MLTrainingStatus.training):
+        raise ValueError(
+            f"Cannot cancel task in '{task.status.value}' status. "
+            f"Only pending or training tasks can be cancelled."
+        )
+    task.status = MLTrainingStatus.cancelled
+    task.cancelled_at = datetime.utcnow()
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+async def retry_ml_training_task(
+    session: AsyncSession,
+    task_id: int,
+) -> MLTrainingTask:
+    stmt = select(MLTrainingTask).where(MLTrainingTask.id == task_id)
+    result = await session.execute(stmt)
+    original_task = result.scalar_one_or_none()
+    if not original_task:
+        raise ValueError(f"Training task {task_id} not found")
+    if original_task.status != MLTrainingStatus.failed:
+        raise ValueError(
+            f"Cannot retry task in '{original_task.status.value}' status. "
+            f"Only failed tasks can be retried."
+        )
+
+    new_task = MLTrainingTask(
+        task_name=f"{original_task.task_name} (retry)",
+        dataset_id=original_task.dataset_id,
+        annotated_version_id=original_task.annotated_version_id,
+        model_type=original_task.model_type,
+        hyperparams=dict(original_task.hyperparams) if original_task.hyperparams else {},
+        split_ratios=dict(original_task.split_ratios) if original_task.split_ratios else {},
+        status=MLTrainingStatus.pending,
+        retry_from=original_task.id,
+        notes=original_task.notes,
+        tags=list(original_task.tags) if original_task.tags else [],
+    )
+    session.add(new_task)
+    await session.commit()
+    await session.refresh(new_task)
+    return new_task
+
+
+async def update_ml_training_task_metadata(
+    session: AsyncSession,
+    task_id: int,
+    notes: Optional[str] = None,
+    tags: Optional[list[str]] = None,
+) -> MLTrainingTask:
+    stmt = select(MLTrainingTask).where(MLTrainingTask.id == task_id)
+    result = await session.execute(stmt)
+    task = result.scalar_one_or_none()
+    if not task:
+        raise ValueError(f"Training task {task_id} not found")
+
+    if notes is not None:
+        if len(notes) > 500:
+            raise ValueError("Notes must not exceed 500 characters")
+        task.notes = notes
+
+    if tags is not None:
+        validated_tags = _validate_tags(tags)
+        task.tags = validated_tags
+
+    await session.commit()
+    await session.refresh(task)
+    return task
 
 
 async def _load_model_for_task(task: MLTrainingTask):

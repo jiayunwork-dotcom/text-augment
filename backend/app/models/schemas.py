@@ -16,6 +16,7 @@ class TaskStatus(str, Enum):
     paused = "paused"
     completed = "completed"
     failed = "failed"
+    cancelled = "cancelled"
 
 
 class FilterStrictness(str, Enum):
@@ -314,6 +315,7 @@ class TrainingExperimentResponse(BaseModel):
     model_path: Optional[str] = None
     error_message: Optional[str] = None
     created_at: datetime
+    cancelled_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -327,6 +329,7 @@ class EvaluationResultResponse(BaseModel):
     weighted_f1: float
     per_class_metrics: dict
     confusion_matrix: Optional[dict] = None
+    roc_auc: Optional[float] = None
     created_at: datetime
 
     class Config:
@@ -599,6 +602,7 @@ class MLTrainingStatus(str, Enum):
     training = "training"
     completed = "completed"
     failed = "failed"
+    cancelled = "cancelled"
 
 
 class MLHyperparams(BaseModel):
@@ -622,6 +626,8 @@ class MLTrainingTaskCreate(BaseModel):
     hyperparams: MLHyperparams = MLHyperparams()
     split_ratios: MLSplitRatios = MLSplitRatios()
     random_seed: int = 42
+    notes: Optional[str] = Field(default=None, max_length=500)
+    tags: list[str] = Field(default_factory=list, max_length=10)
 
 
 class MLTrainingTaskResponse(BaseModel):
@@ -644,6 +650,10 @@ class MLTrainingTaskResponse(BaseModel):
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     created_at: datetime
+    cancelled_at: Optional[datetime] = None
+    retry_from: Optional[int] = None
+    notes: Optional[str] = None
+    tags: list = []
 
     class Config:
         from_attributes = True
@@ -657,6 +667,7 @@ class MLTrainingReportResponse(BaseModel):
     per_class_metrics: dict
     confusion_matrix: list
     class_names: list
+    roc_auc: Optional[float] = None
     created_at: datetime
 
     class Config:
@@ -675,12 +686,19 @@ class MLModelCompareItem(BaseModel):
     weighted_f1: float
     training_duration_seconds: Optional[float] = None
     model_size_bytes: Optional[int] = None
+    per_class_metrics: dict = {}
+
+
+class MLDeltaSummary(BaseModel):
+    best_task_id: Optional[int] = None
+    best_metrics: list[str] = []
 
 
 class MLModelCompareResponse(BaseModel):
     dataset_id: int
     dataset_name: str
     items: list[MLModelCompareItem]
+    delta_summary: Optional[MLDeltaSummary] = None
 
 
 class MLPredictSingleRequest(BaseModel):
@@ -720,3 +738,14 @@ class MLDataLineageNode(BaseModel):
 class MLDataLineageResponse(BaseModel):
     task_id: int
     chain: list[MLDataLineageNode]
+
+
+class MLTrainingTaskPatch(BaseModel):
+    notes: Optional[str] = Field(default=None, max_length=500)
+    tags: Optional[list[str]] = Field(default=None, max_length=10)
+
+
+class MLRetryResponse(BaseModel):
+    original_task_id: int
+    new_task_id: int
+    message: str

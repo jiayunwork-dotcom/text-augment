@@ -20,6 +20,7 @@ class TaskStatus(str, enum.Enum):
     paused = "paused"
     completed = "completed"
     failed = "failed"
+    cancelled = "cancelled"
 
 
 class FilterStrictness(str, enum.Enum):
@@ -198,6 +199,7 @@ class TrainingExperiment(Base):
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    cancelled_at = Column(DateTime, nullable=True)
 
 
 class EvaluationResult(Base):
@@ -211,6 +213,7 @@ class EvaluationResult(Base):
     per_class_metrics = Column(JSON, default=dict)
     test_loss = Column(Float, nullable=True)
     confusion_matrix = Column(JSON, nullable=True)
+    roc_auc = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     experiment = relationship("TrainingExperiment")
@@ -373,6 +376,7 @@ class MLTrainingStatus(str, enum.Enum):
     training = "training"
     completed = "completed"
     failed = "failed"
+    cancelled = "cancelled"
 
 
 class MLTrainingTask(Base):
@@ -397,6 +401,10 @@ class MLTrainingTask(Base):
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    cancelled_at = Column(DateTime, nullable=True)
+    retry_from = Column(Integer, nullable=True)
+    notes = Column(Text, nullable=True)
+    tags = Column(JSON, default=list)
 
     annotated_version = relationship("DatasetVersion", foreign_keys=[annotated_version_id])
 
@@ -411,6 +419,7 @@ class MLTrainingReport(Base):
     per_class_metrics = Column(JSON, default=dict)
     confusion_matrix = Column(JSON, default=list)
     class_names = Column(JSON, default=list)
+    roc_auc = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     task = relationship("MLTrainingTask")

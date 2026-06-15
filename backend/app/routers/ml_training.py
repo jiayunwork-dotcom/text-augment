@@ -15,6 +15,8 @@ from ..models.schemas import (
     MLPredictBatchRequest,
     MLPredictBatchResponse,
     MLDataLineageResponse,
+    MLTrainingTaskPatch,
+    MLRetryResponse,
 )
 from ..services import ml_training as ml_service
 
@@ -44,6 +46,8 @@ async def create_training_task(
             model_type=request.model_type,
             hyperparams=hp,
             split_ratios=splits,
+            notes=request.notes,
+            tags=request.tags,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -55,11 +59,12 @@ async def create_training_task(
 @router.get("/tasks", response_model=list[MLTrainingTaskResponse])
 async def list_training_tasks(
     dataset_id: Optional[int] = Query(None, description="Filter by dataset ID"),
-    status: Optional[MLTrainingStatus] = Query(None, description="Filter by training status (pending/training/completed/failed)"),
-    model_type: Optional[MLModelType] = Query(None, description="Filter by model type (naive_bayes/logistic_regression)"),
+    status: Optional[MLTrainingStatus] = Query(None, description="Filter by training status"),
+    model_type: Optional[MLModelType] = Query(None, description="Filter by model type"),
+    tag: Optional[str] = Query(None, description="Filter by tag"),
     session: AsyncSession = Depends(get_session),
 ):
-    tasks = await ml_service.list_ml_training_tasks(session, dataset_id=dataset_id, status=status)
+    tasks = await ml_service.list_ml_training_tasks(session, dataset_id=dataset_id, status=status, tag=tag)
     if model_type is not None:
         tasks = [t for t in tasks if t.model_type == model_type]
     return [MLTrainingTaskResponse.model_validate(t) for t in tasks]
@@ -73,6 +78,54 @@ async def get_training_task(
     task = await ml_service.get_ml_training_task(session, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Training task not found")
+    return MLTrainingTaskResponse.model_validate(task)
+
+
+@router.post("/tasks/{task_id}/cancel", response_model=MLTrainingTaskResponse)
+async def cancel_training_task(
+    task_id: int,
+    session: AsyncSession = Depends(get_session),
+):
+    try:
+        task = await ml_service.cancel_ml_training_task(session, task_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return MLTrainingTaskResponse.model_validate(task)
+
+
+@router.post("/tasks/{task_id}/retry", response_model=MLRetryResponse)
+async def retry_training_task(
+    task_id: int,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+):
+    try:
+        new_task = await ml_service.retry_ml_training_task(session, task_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    background_tasks.add_task(_run_ml_training_background, new_task.id)
+    return MLRetryResponse(
+        original_task_id=task_id,
+        new_task_id=new_task.id,
+        message="Retry task created successfully",
+    )
+
+
+@router.patch("/tasks/{task_id}", response_model=MLTrainingTaskResponse)
+async def patch_training_task(
+    task_id: int,
+    request: MLTrainingTaskPatch,
+    session: AsyncSession = Depends(get_session),
+):
+    try:
+        task = await ml_service.update_ml_training_task_metadata(
+            session=session,
+            task_id=task_id,
+            notes=request.notes,
+            tags=request.tags,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return MLTrainingTaskResponse.model_validate(task)
 
 

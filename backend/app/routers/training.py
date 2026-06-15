@@ -133,8 +133,8 @@ async def cancel_experiment(
     if not exp:
         raise HTTPException(status_code=404, detail="Experiment not found")
     if exp.status not in (TaskStatus.pending, TaskStatus.running):
-        raise HTTPException(status_code=400, detail="Experiment is not running")
-    exp.status = TaskStatus.failed
-    exp.error_message = "Cancelled by user"
+        raise HTTPException(status_code=400, detail="Experiment is not running or pending")
+    exp.status = TaskStatus.cancelled
+    exp.cancelled_at = __import__("datetime").datetime.utcnow()
     await session.commit()
     return {"experiment_id": experiment_id, "status": "cancelled"}

@@ -23,14 +23,31 @@ async def get_evaluation(session: AsyncSession, experiment_id: int) -> Optional[
     eval_result = result.scalar_one_or_none()
     if not eval_result:
         return None
+
+    per_class = eval_result.per_class_metrics or {}
+    enriched = {}
+    for class_name, metrics in per_class.items():
+        if isinstance(metrics, dict):
+            enriched[class_name] = {
+                "precision": metrics.get("precision", 0.0),
+                "recall": metrics.get("recall", 0.0),
+                "f1-score": metrics.get("f1-score", 0.0),
+                "support": metrics.get("support", 0),
+                "support_ratio": metrics.get("support_ratio"),
+                "prediction_bias": metrics.get("prediction_bias"),
+            }
+        else:
+            enriched[class_name] = metrics
+
     return {
         "id": eval_result.id,
         "experiment_id": eval_result.experiment_id,
         "accuracy": eval_result.accuracy,
         "macro_f1": eval_result.macro_f1,
         "weighted_f1": eval_result.weighted_f1,
-        "per_class_metrics": eval_result.per_class_metrics,
+        "per_class_metrics": enriched,
         "confusion_matrix": eval_result.confusion_matrix,
+        "roc_auc": eval_result.roc_auc,
         "created_at": eval_result.created_at.isoformat() if eval_result.created_at else None,
     }
 

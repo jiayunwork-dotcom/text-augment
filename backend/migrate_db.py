@@ -249,6 +249,7 @@ def main():
                     per_class_metrics TEXT DEFAULT '{}',
                     confusion_matrix TEXT DEFAULT '[]',
                     class_names TEXT DEFAULT '[]',
+                    roc_auc FLOAT,
                     created_at DATETIME,
                     FOREIGN KEY (task_id) REFERENCES ml_training_tasks(id) ON DELETE CASCADE
                 )
@@ -256,6 +257,59 @@ def main():
             print("  ml_training_reports table created.")
         else:
             print("  ml_training_reports table already exists.")
+            columns = [col["name"] for col in inspector.get_columns("ml_training_reports")]
+            new_columns = [
+                ("roc_auc", "FLOAT"),
+            ]
+            for col_name, col_def in new_columns:
+                if col_name not in columns:
+                    print(f"Adding column {col_name} to ml_training_reports...")
+                    conn.execute(text(f"ALTER TABLE ml_training_reports ADD COLUMN {col_name} {col_def}"))
+                    print(f"  Column {col_name} added.")
+                else:
+                    print(f"  Column {col_name} already exists in ml_training_reports.")
+
+        if "ml_training_tasks" in existing_tables:
+            columns = [col["name"] for col in inspector.get_columns("ml_training_tasks")]
+            new_columns = [
+                ("cancelled_at", "DATETIME"),
+                ("retry_from", "INTEGER"),
+                ("notes", "TEXT"),
+                ("tags", "TEXT DEFAULT '[]'"),
+            ]
+            for col_name, col_def in new_columns:
+                if col_name not in columns:
+                    print(f"Adding column {col_name} to ml_training_tasks...")
+                    conn.execute(text(f"ALTER TABLE ml_training_tasks ADD COLUMN {col_name} {col_def}"))
+                    print(f"  Column {col_name} added.")
+                else:
+                    print(f"  Column {col_name} already exists in ml_training_tasks.")
+
+        if "training_experiments" in existing_tables:
+            columns = [col["name"] for col in inspector.get_columns("training_experiments")]
+            new_columns = [
+                ("cancelled_at", "DATETIME"),
+            ]
+            for col_name, col_def in new_columns:
+                if col_name not in columns:
+                    print(f"Adding column {col_name} to training_experiments...")
+                    conn.execute(text(f"ALTER TABLE training_experiments ADD COLUMN {col_name} {col_def}"))
+                    print(f"  Column {col_name} added.")
+                else:
+                    print(f"  Column {col_name} already exists in training_experiments.")
+
+        if "evaluation_results" in existing_tables:
+            columns = [col["name"] for col in inspector.get_columns("evaluation_results")]
+            new_columns = [
+                ("roc_auc", "FLOAT"),
+            ]
+            for col_name, col_def in new_columns:
+                if col_name not in columns:
+                    print(f"Adding column {col_name} to evaluation_results...")
+                    conn.execute(text(f"ALTER TABLE evaluation_results ADD COLUMN {col_name} {col_def}"))
+                    print(f"  Column {col_name} added.")
+                else:
+                    print(f"  Column {col_name} already exists in evaluation_results.")
 
     print("Migration completed successfully!")
 

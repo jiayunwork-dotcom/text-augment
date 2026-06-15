@@ -247,11 +247,21 @@ class DistilBertTrainer(BaseModelTrainer):
                 "support": metrics["support"],
             }
 
+        roc_auc = None
+        if self.num_classes == 2 and all_probs:
+            try:
+                from sklearn.metrics import roc_auc_score
+                prob_arr = np.array(all_probs)
+                roc_auc = float(roc_auc_score(y_true, prob_arr[:, 1]))
+            except Exception:
+                roc_auc = None
+
         return {
             "accuracy": accuracy,
             "macro_f1": macro_f1,
             "weighted_f1": weighted_f1,
             "per_class_metrics": per_class,
+            "roc_auc": roc_auc,
         }
 
     async def predict(self, texts: list[str]) -> tuple[list[int], list[float]]:
@@ -760,6 +770,9 @@ async def execute_training(
     if not experiment:
         return
 
+    if experiment.status == TaskStatus.cancelled:
+        return
+
     version_stmt = select(DatasetVersion).where(DatasetVersion.id == experiment.version_id)
     version = (await session.execute(version_stmt)).scalar_one()
     dataset_stmt = select(Dataset).where(Dataset.id == version.dataset_id)
@@ -936,12 +949,30 @@ async def execute_training(
                         label2id,
                     )
                     eval_result = await trainer.evaluate(test_ds)
+                    per_class_raw = eval_result.get("per_class_metrics", {})
+                    total_support = sum(
+                        v.get("support", 0) for v in per_class_raw.values() if isinstance(v, dict)
+                    )
+                    per_class_enriched = {}
+                    for class_name, metrics in per_class_raw.items():
+                        if not isinstance(metrics, dict):
+                            per_class_enriched[class_name] = metrics
+                            continue
+                        support_val = metrics.get("support", 0)
+                        support_ratio = support_val / total_support if total_support > 0 else 0.0
+                        per_class_enriched[class_name] = {
+                            **metrics,
+                            "support_ratio": round(support_ratio, 6),
+                            "prediction_bias": None,
+                        }
+
                     eval_row = EvaluationResult(
                         experiment_id=experiment.id,
                         accuracy=eval_result.get("accuracy", 0),
                         macro_f1=eval_result.get("macro_f1", 0),
                         weighted_f1=eval_result.get("weighted_f1", 0),
-                        per_class_metrics=eval_result.get("per_class_metrics", {}),
+                        per_class_metrics=per_class_enriched,
+                        roc_auc=eval_result.get("roc_auc"),
                     )
                     session.add(eval_row)
 
